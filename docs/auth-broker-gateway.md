@@ -47,7 +47,7 @@ The broker is the only writer of OAuth refresh tokens. Clients (including the ga
 ### CLI
 
 ```
-omp auth-broker serve     [--bind=host:port] [--trust-proxy-headers]  # boot the broker
+omp auth-broker serve     [--bind=host:port] [--trust-proxy-headers] [-e <file>]  # boot the broker
 omp auth-broker token     [--regenerate] [--json]               # print or rotate the bearer token
 omp auth-broker login     [<provider>] [--via=user@host] [--dry-run]
 omp auth-broker logout    [<provider>]
@@ -66,6 +66,21 @@ omp auth-broker status    [--json]
 - `import <file|dir>` imports CLIProxyAPI-style JSON credentials into the local SQLite store. Maps `type` field → omp provider (`claude → anthropic`, `codex → openai-codex`, `gemini → google-gemini-cli`, `antigravity → google-antigravity`, `gemini-cli → google-gemini-cli`).
 - `migrate --from-local` uploads local SQLite credentials to the configured broker (`POST /v1/credential`). Local API keys are included by default; local OAuth rows are skipped unless `--include-oauth` is set; environment-derived API keys are skipped unless `--include-env` is set. Re-runs are idempotent against the broker snapshot.
 - `status` health-pings the configured remote broker.
+
+### Extension OAuth providers
+
+OAuth credentials uploaded by a client can belong to an extension provider, such as Nous Portal. Install that provider on the **broker host** and explicitly load its entry point when starting the broker:
+
+```sh
+omp auth-broker serve --extension ./provider.ts
+```
+
+`--extension` / `-e` is repeatable. The broker registers these providers before starting the background refresher, and both background and client-requested refreshes call the provider's `refreshToken` handler. Refresh-token rotation is persisted in the broker's vault; clients still receive only redacted refresh tokens.
+
+The broker does not discover ambient extensions, installed plugins, or ambient hooks, fetch model catalogs, or start a coding-agent session. With no `-e` paths, extension loading remains off. Extension files execute with the broker's privileges and access to its credential vault: pass only trusted provider entry points, not a directory of unrelated desktop integrations.
+
+Installing the plugin only on a client, or logging in again there, does not teach a standalone broker how to refresh it. Restart the broker with the explicit provider path after installing or updating its code.
+
 
 ### Endpoints
 

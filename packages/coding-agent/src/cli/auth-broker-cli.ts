@@ -2,7 +2,7 @@
  * `omp auth-broker` command handlers.
  *
  * Sub-verbs:
- *   - `serve [--bind=…] [--trust-proxy-headers]` — boots the broker against the local SQLite store.
+ *   - `serve [--bind=…] [--trust-proxy-headers] [-e <file>]` — boots the broker against the local SQLite store.
  *   - `token` / `token --regenerate` — manages the bearer token file.
  *   - `login <provider> [--via=user@host]` — logs into a provider locally, or
  *     via SSH tunnel into a remote broker host.
@@ -32,14 +32,18 @@ import {
 	SqliteAuthCredentialStore,
 } from "@oh-my-pi/pi-ai";
 import { AuthBrokerClient, DEFAULT_AUTH_BROKER_BIND, startAuthBroker } from "@oh-my-pi/pi-ai/auth-broker";
-import { refreshOAuthToken } from "@oh-my-pi/pi-ai/oauth";
+import { OAuthError } from "@oh-my-pi/pi-ai/error";
+import { getOAuthProvider, refreshOAuthToken } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
-import { $which, APP_NAME, getAgentDbPath, getConfigRootDir, logger, VERSION } from "@oh-my-pi/pi-utils";
+import { $which, APP_NAME, getAgentDbPath, getConfigRootDir, getProjectDir, logger, VERSION } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { setTransports as setLoggerTransports } from "@oh-my-pi/pi-utils/logger";
 import { $ } from "bun";
+import { ModelRegistry } from "../config/model-registry";
+import { Settings } from "../config/settings";
 import { refreshManagedMcpOAuthCredential } from "../mcp/oauth-credentials";
 import { isManagedMCPOAuthCredentialId, mcpOAuthServerUrlFromCredentialId } from "../mcp/oauth-flow";
+import { loadCliExtensionProviders } from "../sdk";
 import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
 import { pickIndex, pickOAuthProvider, runTerminalOAuthLogin } from "./oauth-terminal";
 import { generateToken, readTokenFile, writeTokenFile } from "./token-file";
@@ -52,6 +56,8 @@ export interface AuthBrokerCommandArgs {
 		json?: boolean;
 		bind?: string;
 		trustProxyHeaders?: boolean;
+		/** `serve`: trusted extension files that register provider refresh handlers. */
+		extensions?: string[];
 		regenerate?: boolean;
 		via?: string;
 		provider?: string;
@@ -103,7 +109,7 @@ async function ensureToken(): Promise<string> {
  * OAuth refresh handler for `omp auth-broker serve`'s {@link AuthStorage}.
  *
  * The vault holds provider OAuth rows AND OMP-managed `mcp_oauth:*` rows.
- * Provider rows refresh through the per-provider registry. MCP rows are
+ * Provider rows refresh through the built-in or explicitly loaded extension registry. MCP rows are
  * self-describing — the embedded token endpoint and client credentials are the
  * only refresh material — so they refresh with a generic `refresh_token` grant.
  * The serve process never loads the MCP manager, so this is the only place that
@@ -122,9 +128,19 @@ export function refreshBrokerOAuthCredential(
 			signal,
 		});
 	}
-	// Non-MCP rows: same per-provider path AuthStorage would take by default
-	// (the serve process registers no custom OAuth providers).
-	return refreshOAuthToken(provider as OAuthProvider, credential);
+	const customProvider = getOAuthProvider(provider);
+	if (customProvider) {
+		if (!customProvider.refreshToken) {
+			return Promise.reject(
+				new OAuthError(`OAuth provider "${provider}" does not support token refresh`, {
+					kind: "validation",
+					provider,
+				}),
+			);
+		}
+		return customProvider.refreshToken(credential, signal);
+	}
+	return refreshOAuthToken(provider as OAuthProvider, credential, signal);
 }
 
 /** The `omp auth-broker serve` vault: tokens refresh in this process through {@link refreshBrokerOAuthCredential}. */
@@ -148,6 +164,18 @@ async function runServe(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	const store = await SqliteAuthCredentialStore.open(dbPath);
 	const storage = createBrokerAuthStorage(store);
 	await storage.credentials.reload();
+	if (flags.extensions?.length) {
+		const cwd = getProjectDir();
+		const settings = await Settings.init({ cwd });
+		const modelRegistry = new ModelRegistry(storage);
+		// Only explicitly trusted provider code runs in the credential vault.
+		await loadCliExtensionProviders(modelRegistry, settings, cwd, {
+			additionalExtensionPaths: flags.extensions,
+			disableExtensionDiscovery: true,
+			includeAmbientHooks: false,
+			discoverModels: false,
+		});
+	}
 	const handle = startAuthBroker({
 		storage,
 		bind,

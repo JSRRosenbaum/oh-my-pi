@@ -30,6 +30,11 @@ export default class AuthBroker extends Command {
 	static flags = {
 		json: Flags.boolean({ description: "Output JSON" }),
 		bind: Flags.string({ description: "Bind address for `serve` (host:port)", char: "b" }),
+		extension: Flags.string({
+			char: "e",
+			description: "Load a trusted provider extension file for OAuth refresh (serve; repeatable)",
+			multiple: true,
+		}),
 		regenerate: Flags.boolean({ description: "Regenerate the bearer token" }),
 		via: Flags.string({
 			description: "SSH user@host for remote login (login --via=user@host)",
@@ -58,6 +63,7 @@ export default class AuthBroker extends Command {
 	static examples = [
 		"# Boot the broker against the local SQLite store\n  omp auth-broker serve",
 		"# Boot on a non-default port\n  omp auth-broker serve --bind=127.0.0.1:9000",
+		"# Enable refresh for an extension provider on the broker host\n  omp auth-broker serve -e ./provider.ts",
 		"# Trust client IP headers from a trusted reverse proxy\n  omp auth-broker serve --trust-proxy-headers",
 		"# Print the bearer token\n  omp auth-broker token",
 		"# Rotate the bearer token\n  omp auth-broker token --regenerate",
@@ -85,6 +91,7 @@ export default class AuthBroker extends Command {
 			flags: {
 				json: flags.json,
 				bind: flags.bind,
+				extensions: flags.extension,
 				regenerate: flags.regenerate,
 				via: flags.via,
 				// `login`/`logout` reuse the legacy `provider` slot; `import` keeps `source` separate

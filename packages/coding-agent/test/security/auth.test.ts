@@ -4,7 +4,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { AuthBrokerClient, RemoteAuthCredentialStore, startAuthBroker } from "@oh-my-pi/pi-ai/auth-broker";
 import type { ApiKeyResolver } from "@oh-my-pi/pi-ai/auth-retry";
-import * as oauthRegistry from "@oh-my-pi/pi-ai/registry/oauth";
 import { registerOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/registry/oauth";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
@@ -181,6 +180,7 @@ describe("exact security OAuth resolver", () => {
 	test("a provider 401 reuses the auth broker's recent mint for the pinned row", async () => {
 		const provider = "unit-security-broker-recovery";
 		const sourceId = "security-auth-test";
+		let mints = 0;
 		registerOAuthProvider({
 			id: provider,
 			name: "Security Broker Recovery Unit",
@@ -188,15 +188,11 @@ describe("exact security OAuth resolver", () => {
 			async login() {
 				return { access: "login-access", refresh: "login-refresh", expires: Date.now() + 3_600_000 };
 			},
-		});
-		// The broker's refresh handler exchanges tokens through the provider registry.
-		let mints = 0;
-		const exchange = vi
-			.spyOn(oauthRegistry, "refreshOAuthToken")
-			.mockImplementation(async (_provider, credential) => {
+			async refreshToken(credential) {
 				mints += 1;
 				return { ...credential, access: `access-${mints}`, expires: Date.now() + 3_600_000 };
-			});
+			},
+		});
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "security-broker-recovery-"));
 		const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 		await store.saveOAuth(provider, {
@@ -246,7 +242,6 @@ describe("exact security OAuth resolver", () => {
 			await handle.close();
 			brokerStorage.close();
 			store.close();
-			exchange.mockRestore();
 			unregisterOAuthProviders(sourceId);
 			await removeWithRetries(tempDir);
 		}
