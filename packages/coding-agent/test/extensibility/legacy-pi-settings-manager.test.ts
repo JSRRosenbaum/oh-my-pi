@@ -166,7 +166,7 @@ describe("legacy pi SettingsManager shim (issue #10397)", () => {
 				sdkSettings,
 			);
 
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 
 			expect(observed).toBe(sdkSettings);
 			expect(observed?.getGlobalSettings().piVim).toEqual({ session: "sdk" });

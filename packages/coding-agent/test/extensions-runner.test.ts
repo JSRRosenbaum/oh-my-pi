@@ -1706,7 +1706,7 @@ describe("ExtensionRunner", () => {
 			testSetExtensionHandlerTimeoutMs(10);
 
 			const startedAt = performance.now();
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 			const elapsedMs = performance.now() - startedAt;
 
 			expect(elapsedMs).toBeGreaterThanOrEqual(8);
@@ -1764,7 +1764,7 @@ describe("ExtensionRunner", () => {
 			testSetSessionShutdownHandlerTimeoutMs(10);
 
 			const startedAt = performance.now();
-			await runner.emit({ type: "session_shutdown" });
+			await runner.emit({ type: "session_shutdown", reason: "quit" });
 			const elapsedMs = performance.now() - startedAt;
 
 			expect(elapsedMs).toBeGreaterThanOrEqual(8);
@@ -2332,7 +2332,7 @@ describe("ExtensionRunner", () => {
 				},
 			);
 
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 
 			expect(globalState.__ompMemoryStatus).toMatchObject({
 				backend: "mnemopi",
@@ -2413,7 +2413,7 @@ describe("ExtensionRunner", () => {
 				},
 			);
 
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 
 			expect(serviceTiers).toEqual({ openai: "priority" });
 			expect(snapshots).toEqual([{ openai: "scale" }]);
@@ -2480,7 +2480,7 @@ describe("ExtensionRunner", () => {
 				},
 			);
 
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 
 			expect(sessionManager.getSessionName()).toBe("Named by extension");
 			expect(sessionManager.getHeader()?.title).toBe("Named by extension");

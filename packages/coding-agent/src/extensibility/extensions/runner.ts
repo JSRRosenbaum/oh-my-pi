@@ -94,6 +94,7 @@ import type {
 	SessionCompactingResult,
 	SessionStopEvent,
 	SessionStopEventResult,
+	TurnEndEventResult,
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolRegistrationListener,
@@ -276,12 +277,27 @@ function createHandlerContext(
 	ctx: ExtensionContext,
 	handlerSignal: AbortSignal,
 	timeoutBudget?: HandlerTimeoutBudget,
+	compactTimeoutBudget?: HandlerTimeoutBudget,
 ): ExtensionContext {
 	const scoped: ExtensionContext = Object.create(ctx);
-	Object.defineProperty(scoped, "ui", {
-		value: createHandlerUIContext(ctx.ui, handlerSignal, timeoutBudget),
-		enumerable: true,
-		configurable: true,
+	Object.defineProperties(scoped, {
+		ui: {
+			value: createHandlerUIContext(ctx.ui, handlerSignal, timeoutBudget),
+			enumerable: true,
+			configurable: true,
+		},
+		compact: {
+			value: async (instructionsOrOptions?: string | CompactOptions) => {
+				compactTimeoutBudget?.pause();
+				try {
+					return await ctx.compact(instructionsOrOptions);
+				} finally {
+					compactTimeoutBudget?.resume();
+				}
+			},
+			enumerable: true,
+			configurable: true,
+		},
 	});
 	return scoped;
 }
@@ -389,6 +405,10 @@ const MAX_PENDING_MCP_NOTIFICATIONS = 100;
  * Events handled by the generic emit() method.
  * Events with dedicated emitXxx() methods are excluded for stronger type safety.
  */
+type SessionLifecycleEvent = Extract<
+	ExtensionEvent,
+	{ type: "session_switch" | "session_branch" | "session_tree" | "session_shutdown" }
+>;
 type RunnerEmitEvent = Exclude<
 	ExtensionEvent,
 	| ToolCallEvent
@@ -402,7 +422,6 @@ type RunnerEmitEvent = Exclude<
 	| ResourcesDiscoverEvent
 	| InputEvent
 >;
-
 type SessionBeforeEvent = Extract<
 	RunnerEmitEvent,
 	{ type: "session_before_switch" | "session_before_branch" | "session_before_compact" | "session_before_tree" }
@@ -426,7 +445,9 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 					? SessionCompactingResult | undefined
 					: TEvent extends { type: "session_stop" }
 						? SessionStopEventResult | undefined
-						: undefined;
+						: TEvent extends { type: "turn_end" }
+							? TurnEndEventResult | undefined
+							: undefined;
 
 // Session-lifecycle handler types live once in session-handler-types (imported
 // above for local use); re-exported here to keep this module's public API stable.
@@ -444,16 +465,37 @@ export type ShutdownHandler = () => void;
  * cleanup run even when a handler fails so extension background work — and a
  * fallback bound to this session's context — cannot outlive its host.
  */
-export async function emitSessionShutdownEvent(extensionRunner: ExtensionRunner | undefined): Promise<boolean> {
+export async function emitSessionShutdownEvent(
+	extensionRunner: ExtensionRunner | undefined,
+	reason: Extract<ExtensionEvent, { type: "session_shutdown" }>["reason"] = "quit",
+): Promise<boolean> {
 	if (!extensionRunner) return false;
 	try {
-		if (!extensionRunner.hasHandlers("session_shutdown")) return false;
-		await extensionRunner.emit({
-			type: "session_shutdown",
-		});
-		return true;
+		const hadHandlers = extensionRunner.hasHandlers("session_shutdown");
+		await extensionRunner.emit({ type: "session_shutdown", reason });
+		return hadHandlers;
 	} finally {
 		extensionRunner.disposeFileFallbacks();
+		extensionRunner.clearManagedTimers();
+	}
+}
+/**
+ * Emit a replacement-session shutdown and clear its timers without disposing
+ * file-write fallbacks that remain registered for the lifetime of this runner.
+ */
+export async function emitSessionReplacementShutdownEvent(
+	extensionRunner: ExtensionRunner | undefined,
+	reason: Exclude<Extract<ExtensionEvent, { type: "session_shutdown" }>["reason"], "quit">,
+	targetSessionFile?: string,
+): Promise<void> {
+	if (!extensionRunner) return;
+	try {
+		await extensionRunner.emit({
+			type: "session_shutdown",
+			reason,
+			...(targetSessionFile ? { targetSessionFile } : {}),
+		});
+	} finally {
 		extensionRunner.clearManagedTimers();
 	}
 }
@@ -536,6 +578,8 @@ export class ExtensionRunner {
 	#resolvePlanReviewFn: NonNullable<ExtensionContextActions["resolvePlanReview"]> = () => false;
 	#getPendingPlanReviewFn: NonNullable<ExtensionContextActions["getPendingPlanReview"]> = () => undefined;
 	#openPlanReviewFn: NonNullable<ExtensionContextActions["openPlanReview"]> = async () => false;
+	#getPlanModeFn?: ExtensionContextActions["getPlanMode"];
+	#setPlanModeFn?: ExtensionContextActions["setPlanMode"];
 	#getMemoryFn?: () => MemoryRuntimeContext | undefined;
 	#createAnnotations?: ExtensionAnnotationsFactory;
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
@@ -549,6 +593,8 @@ export class ExtensionRunner {
 	#toolRegistrationSubscribers = new Set<(extension: Extension) => ToolRegistrationListener>();
 	/** Latest `session_start` broadcast, replayed to extensions added afterwards. */
 	#sessionStartEvent: RunnerEmitEvent | undefined;
+	/** Synchronous native lifecycle observers run before extension handlers. */
+	#sessionLifecycleListeners = new Set<(event: SessionLifecycleEvent) => void>();
 	/**
 	 * Buffer for `credential_disabled` events received via {@link emitCredentialDisabled}
 	 * before {@link initialize} has run. Drained through {@link emit} once initialize sets
@@ -841,6 +887,8 @@ export class ExtensionRunner {
 		if (contextActions.resolvePlanReview) this.#resolvePlanReviewFn = contextActions.resolvePlanReview;
 		if (contextActions.getPendingPlanReview) this.#getPendingPlanReviewFn = contextActions.getPendingPlanReview;
 		if (contextActions.openPlanReview) this.#openPlanReviewFn = contextActions.openPlanReview;
+		this.#getPlanModeFn = contextActions.getPlanMode;
+		this.#setPlanModeFn = contextActions.setPlanMode;
 		this.#getContextUsageFn = contextActions.getContextUsage;
 		this.#compactFn = contextActions.compact;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
@@ -1006,6 +1054,11 @@ export class ExtensionRunner {
 	/** Waits until the interactive transcript can show the tool call being approved. */
 	async waitForToolApprovalPreview(toolCallId: string): Promise<void> {
 		await this.#toolApprovalPreviewWaiter?.(toolCallId);
+	}
+	/** Observe actual session transitions before extension producers can handle them. */
+	onSessionLifecycle(listener: (event: SessionLifecycleEvent) => void): () => void {
+		this.#sessionLifecycleListeners.add(listener);
+		return () => this.#sessionLifecycleListeners.delete(listener);
 	}
 
 	/** Whether the user approved `key` for the current session; a new or switched session starts with none. */
@@ -1378,6 +1431,15 @@ export class ExtensionRunner {
 	}
 
 	hasHandlers(eventType: string): boolean {
+		if (
+			this.#sessionLifecycleListeners.size > 0 &&
+			(eventType === "session_switch" ||
+				eventType === "session_branch" ||
+				eventType === "session_tree" ||
+				eventType === "session_shutdown")
+		) {
+			return true;
+		}
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get(eventType);
 			if (handlers && handlers.length > 0) {
@@ -1500,6 +1562,8 @@ export class ExtensionRunner {
 			resolvePlanReview: (reviewId, choice, input) => this.#resolvePlanReviewFn(reviewId, choice, input),
 			getPendingPlanReview: () => this.#getPendingPlanReviewFn(),
 			openPlanReview: () => this.#openPlanReviewFn(),
+			getPlanMode: this.#getPlanModeFn ? () => this.#getPlanModeFn!() : undefined,
+			setPlanMode: this.#setPlanModeFn ? (action, options) => this.#setPlanModeFn!(action, options) : undefined,
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			runEphemeralTurn: runEphemeralTurn
 				? async options => {
@@ -1640,6 +1704,7 @@ export class ExtensionRunner {
 								ctx,
 								handlerSignal,
 								event.type === "tool_call" ? budget : undefined,
+								budget,
 							);
 							result = await this.#toolRegistrationScope.run(registrationScope, () =>
 								handler(event, handlerContext),
@@ -1696,9 +1761,24 @@ export class ExtensionRunner {
 	}
 
 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+		if (
+			event.type === "session_switch" ||
+			event.type === "session_branch" ||
+			event.type === "session_tree" ||
+			event.type === "session_shutdown"
+		) {
+			for (const listener of this.#sessionLifecycleListeners) {
+				try {
+					listener(event);
+				} catch (error) {
+					logger.warn("Native session lifecycle observer failed", {
+						event: event.type,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+		}
 		const result = await this.#emitTo(this.extensions, event);
-		// Recorded once the broadcast ends: an extension added mid-broadcast is
-		// reached by the live iteration, one added later gets the replay.
 		if (event.type === "session_start") this.#sessionStartEvent = event;
 		return result;
 	}
@@ -1712,7 +1792,12 @@ export class ExtensionRunner {
 		// message_update / tool_execution_* per delta with usually no extension
 		// subscribed; building `ctx` for a zero-handler event is pure waste.
 		let ctx: ExtensionContext | undefined;
-		let result: SessionBeforeEventResult | SessionCompactingResult | SessionStopEventResult | undefined;
+		let result:
+			| SessionBeforeEventResult
+			| SessionCompactingResult
+			| SessionStopEventResult
+			| TurnEndEventResult
+			| undefined;
 
 		if (this.#isSessionShutdownEvent(event)) {
 			const timeoutMs = handlerTimeoutForEvent(event.type);
@@ -1733,11 +1818,18 @@ export class ExtensionRunner {
 			const handlers = ext.handlers.get(event.type);
 			if (!handlers || handlers.length === 0) continue;
 			ctx ??= this.createContext();
-
 			for (const handler of handlers) {
+				const handlerEvent =
+					event.type === "turn_end"
+						? ({
+								...event,
+								entries: (result as TurnEndEventResult | undefined)?.entries ?? [],
+								continue: (result as TurnEndEventResult | undefined)?.continue ?? false,
+							} as TEvent)
+						: event;
 				const handlerResult = await this.#runHandlerWithTimeout(
 					handler,
-					event,
+					handlerEvent,
 					ctx,
 					ext,
 					handlerTimeoutForEvent(event.type),
@@ -1763,6 +1855,16 @@ export class ExtensionRunner {
 						(typeof stopResult.additionalContext === "string" && stopResult.additionalContext.length > 0) ||
 						(typeof stopResult.reason === "string" && stopResult.reason.length > 0);
 					if (stopResult.continue === true && hasContinuationContext) result ??= stopResult;
+				}
+				if (event.type === "turn_end" && handlerResult) {
+					const turnEndResult = handlerResult as TurnEndEventResult;
+					const previous = result as TurnEndEventResult | undefined;
+					if (turnEndResult.entries !== undefined || turnEndResult.continue !== undefined) {
+						result = {
+							entries: turnEndResult.entries ?? previous?.entries ?? [],
+							continue: turnEndResult.continue ?? previous?.continue ?? false,
+						};
+					}
 				}
 			}
 		}

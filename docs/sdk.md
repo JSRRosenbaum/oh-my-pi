@@ -251,6 +251,33 @@ continuing through retry, compaction, or stop-time reminders.
 is a background-job result; that wake is not guaranteed if the job is cancelled
 or its delivery is suppressed.
 
+### Extension completion and remote dialogs
+
+Extension lifecycle events are distinct from `AgentSession.subscribe()` display events:
+
+- `turn_end` includes required native `outcome: "completed" | "aborted" | "error"`. Because the field is required by the schema and generated Go, Python, and Rust clients, new clients need a matching patched host; compatibility with older hosts is not claimed. Handlers are awaited at the model-step boundary. Successful turns may return `{ entries, continue }`; supported entries are `custom` metadata and `custom_message` model context. Entries commit in order before another provider request. `continue: true` stays inside the owning prompt episode, rather than creating another user prompt. Cancellation suppresses continuation but does not erase an already-accepted contribution.
+- `agent_end` can precede prompt unwind or scheduled maintenance. Extension consumers needing final idle use `agent_settled`, emitted after the owning episode unwinds, its end notification completes, and no pending continuation or async wake remains. A successor run invalidates an older pending settlement.
+- `model_select` reports successful model changes. `session_compact_failed` terminates started failed/cancelled compaction attempts with their actual reason, `aborted`, `willRetry`, and `fromExtension`; manual, threshold, overflow, idle and incomplete-recovery reasons remain distinguishable.
+- `ui_prompt_start` / `ui_prompt_end` bracket an overlapping user-dialog wait span. These events are not a privilege-forwarding API.
+
+Interactive extensions can register a session-local remote answer surface with
+`ctx.ui.registerRemoteDialogHost(host)`. It returns a disposer. `host.request(request, signal)`
+receives a typed select/editor/confirm/input/ask request with session/generation provenance,
+and returns `{ kind: "answered", value }`, `{ kind: "unavailable" }`, or `null` when unsupported.
+Local and remote dialogs race: the first valid answer wins, losing requests are aborted, and
+unavailable/erroring remote hosts leave the local dialog usable. Registration and pending
+requests expire on native session transitions and shutdown; register again for the replacement
+session. `session_tree` also expires registration without emitting `session_start`, so hosts
+must re-register separately when handling that event. Public extension dialogs have `extension-user` provenance; sharing the ask renderer
+does not authorize privileged configuration, tool approval or reporting-consent forwarding.
+
+Native plan integrations use `getPendingPlanReview()`, `openPlanReview()` and
+`resolvePlanReview()` rather than terminal keystrokes. Supporting interactive contexts also
+provide `getPlanMode()` and `setPlanMode("enter" | "pause" | "exit", { confirmed? })`.
+Pause/exit with a draft require explicit producer-owned confirmation. These optional actions
+do not exist in unsupported/headless modes and must not be replaced with a fake success.
+
+
 ## Prompt lifecycle
 
 `session.prompt(text, options?)` is the primary entry point.

@@ -33,6 +33,7 @@ export type * from "./lsp";
 export * from "./main";
 // Run modes for programmatic SDK usage
 export * from "./modes";
+export * from "./modes/remote-dialogs";
 export * from "./modes/components";
 // Theme utilities for custom tools
 export * from "@oh-my-pi/pi-tui/theme";

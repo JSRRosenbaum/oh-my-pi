@@ -31,7 +31,7 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 export default function myExtension(pi: ExtensionAPI) {
   const z = pi.zod;
 
-  // Runs once when the session loads
+  // Runs whenever a session context starts, including startup and replacement sessions
   pi.on("session_start", async (_event, ctx) => {
     ctx.ui.notify(`Session ready in ${ctx.cwd}`, "info");
   });

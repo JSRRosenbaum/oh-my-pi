@@ -58,6 +58,7 @@ import type {
 	AgentTool,
 	AgentToolContext,
 	AgentTurnEndContext,
+	AgentTurnEndResult,
 	AsideMessage,
 	PrepareQueuedMessages,
 	QueuedMessageQueue,
@@ -495,7 +496,11 @@ export class Agent {
 	#onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
-	#onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void;
+	#onTurnEnd?: (
+		messages: AgentMessage[],
+		signal?: AbortSignal,
+		context?: AgentTurnEndContext,
+	) => Promise<AgentTurnEndResult | void> | AgentTurnEndResult | void;
 	#onModelCallSystemPrompt?: (systemPrompt: string[]) => void;
 	#beforeModelCall?: AgentBeforeModelCall;
 	#additionalBeforeModelCalls = new Set<AgentBeforeModelCall>();
@@ -1165,7 +1170,11 @@ export class Agent {
 	}
 	setOnTurnEnd(
 		fn:
-			| ((messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void)
+			| ((
+					messages: AgentMessage[],
+					signal?: AbortSignal,
+					context?: AgentTurnEndContext,
+			  ) => Promise<AgentTurnEndResult | void> | AgentTurnEndResult | void)
 			| undefined,
 	): void {
 		this.#onTurnEnd = fn;
@@ -2182,7 +2191,20 @@ export class Agent {
 				if (bufferedCursorContext !== undefined) {
 					agentEndMessages.push(this.#emitCursorAdditionalContext(bufferedCursorContext));
 				}
-				this.#emit({ type: "turn_end", message: errorMsg, toolResults });
+				this.#emit({ type: "turn_end", message: errorMsg, toolResults, outcome: "error" });
+				try {
+					await this.#onTurnEnd?.(this.#state.messages, loopSignal, {
+						message: errorMsg,
+						toolResults,
+						outcome: "error",
+						additionalMessages: [],
+						willContinue: false,
+					});
+				} catch (callbackError) {
+					logger.warn("Agent terminal turn-end callback rejected", {
+						error: callbackError instanceof Error ? callbackError.message : String(callbackError),
+					});
+				}
 				turnOpen = false;
 				this.#emit({ type: "agent_end", messages: agentEndMessages });
 			} else {
@@ -2198,7 +2220,20 @@ export class Agent {
 				this.appendMessage(errorMsg);
 				this.#state.error = errorMessage;
 				this.#emit({ type: "message_end", message: errorMsg });
-				this.#emit({ type: "turn_end", message: errorMsg, toolResults: [] });
+				this.#emit({ type: "turn_end", message: errorMsg, toolResults: [], outcome: "aborted" });
+				try {
+					await this.#onTurnEnd?.(this.#state.messages, loopSignal, {
+						message: errorMsg,
+						toolResults: [],
+						outcome: "aborted",
+						additionalMessages: [],
+						willContinue: false,
+					});
+				} catch (callbackError) {
+					logger.warn("Agent terminal turn-end callback rejected", {
+						error: callbackError instanceof Error ? callbackError.message : String(callbackError),
+					});
+				}
 				this.#emit({ type: "agent_end", messages: [errorMsg] });
 			}
 		} finally {

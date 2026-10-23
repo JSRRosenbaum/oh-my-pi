@@ -490,6 +490,8 @@ export interface SendUserMessageOptions {
 	deliverAs?: "steer" | "followUp" | "aside";
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Expand prompt templates and route slash commands only when explicitly enabled. */
+	expandPromptTemplates?: boolean;
 }
 
 /** Result from a handoff operation. */

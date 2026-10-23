@@ -253,7 +253,7 @@ describe("Warp CLI-agent events", () => {
 			event: SessionStartEvent,
 			context: ExtensionContext,
 		) => void;
-		sessionStart({ type: "session_start" }, bridgeContext("session-123", sessionCwd));
+		sessionStart({ type: "session_start", reason: "startup" }, bridgeContext("session-123", sessionCwd));
 		const body = parseBodies(write)[0];
 		expect(body).toMatchObject({
 			event: "session_start",
@@ -275,7 +275,7 @@ describe("Warp CLI-agent events", () => {
 		const messageStart = handlers.get("message_start") as never as (event: MessageStartEvent) => void;
 		const agentEnd = handlers.get("agent_end") as never as (event: AgentEndEvent) => void;
 
-		sessionStart({ type: "session_start" }, context);
+		sessionStart({ type: "session_start", reason: "startup" }, context);
 		write.mockClear();
 
 		messageStart(userMessageStart("first user prompt"));
@@ -316,7 +316,7 @@ describe("Warp CLI-agent events", () => {
 		const agentEnd = handlers.get("agent_end") as never as (event: AgentEndEvent) => void;
 		const input = handlers.get("input") as never as ((event: InputEvent) => void) | undefined;
 
-		sessionStart({ type: "session_start" }, context);
+		sessionStart({ type: "session_start", reason: "startup" }, context);
 		write.mockClear();
 
 		// Early queued input must not overwrite the current response's query.
@@ -375,7 +375,7 @@ describe("Warp CLI-agent events", () => {
 		const messageStart = handlers.get("message_start") as never as (event: MessageStartEvent) => void;
 		const agentEnd = handlers.get("agent_end") as never as (event: AgentEndEvent) => void;
 
-		sessionStart({ type: "session_start" }, context);
+		sessionStart({ type: "session_start", reason: "startup" }, context);
 		write.mockClear();
 
 		messageStart(userMessageStart("prompt A"));
@@ -410,7 +410,7 @@ describe("Warp CLI-agent events", () => {
 		const messageStart = handlers.get("message_start") as never as (event: MessageStartEvent) => void;
 		const agentEnd = handlers.get("agent_end") as never as (event: AgentEndEvent) => void;
 
-		sessionStart({ type: "session_start" }, context);
+		sessionStart({ type: "session_start", reason: "startup" }, context);
 		write.mockClear();
 
 		messageStart(skillPromptStart("skill body as query", "user"));
@@ -463,7 +463,7 @@ describe("Warp CLI-agent events", () => {
 		const messageStart = handlers.get("message_start") as never as (event: MessageStartEvent) => void;
 		const agentEnd = handlers.get("agent_end") as never as (event: AgentEndEvent) => void;
 
-		sessionStart({ type: "session_start" }, context);
+		sessionStart({ type: "session_start", reason: "startup" }, context);
 		write.mockClear();
 
 		messageStart(userMessageStart("prompt error"));
@@ -581,7 +581,7 @@ describe("Warp CLI-agent events", () => {
 		const messageStart = handlers.get("message_start") as never as (event: MessageStartEvent) => void;
 		const agentEnd = handlers.get("agent_end") as never as (event: AgentEndEvent) => void;
 
-		sessionStart({ type: "session_start" }, context);
+		sessionStart({ type: "session_start", reason: "startup" }, context);
 		write.mockClear();
 
 		messageStart(userMessageStart("retry me"));
@@ -635,7 +635,7 @@ describe("Warp CLI-agent events", () => {
 		const messageStart = handlers.get("message_start") as never as (event: MessageStartEvent) => void;
 		const agentEnd = handlers.get("agent_end") as never as (event: AgentEndEvent) => void;
 
-		sessionStart({ type: "session_start" }, context);
+		sessionStart({ type: "session_start", reason: "startup" }, context);
 		write.mockClear();
 
 		const query = `${"q".repeat(199)}😀tail`;
@@ -679,7 +679,7 @@ describe("Warp CLI-agent events", () => {
 		const messageStart = handlers.get("message_start") as never as (event: MessageStartEvent) => void;
 		const agentEnd = handlers.get("agent_end") as never as (event: AgentEndEvent) => void;
 
-		sessionStart({ type: "session_start" }, context);
+		sessionStart({ type: "session_start", reason: "startup" }, context);
 		messageStart(userMessageStart("old prompt"));
 		sessionId = "session-new";
 		write.mockClear();
@@ -726,7 +726,7 @@ describe("Warp CLI-agent events", () => {
 		const messageStart = handlers.get("message_start") as never as (event: MessageStartEvent) => void;
 		const agentEnd = handlers.get("agent_end") as never as (event: AgentEndEvent) => void;
 
-		sessionStart({ type: "session_start" }, context);
+		sessionStart({ type: "session_start", reason: "startup" }, context);
 		messageStart(userMessageStart("old prompt"));
 		sessionId = "session-branched";
 		write.mockClear();
@@ -759,7 +759,7 @@ describe("Warp CLI-agent events", () => {
 			event: SessionStartEvent,
 			context: ExtensionContext,
 		) => void;
-		sessionStart({ type: "session_start" }, bridgeContext());
+		sessionStart({ type: "session_start", reason: "startup" }, bridgeContext());
 		write.mockClear();
 
 		const approvalRequested = handlers.get("tool_approval_requested") as never as (

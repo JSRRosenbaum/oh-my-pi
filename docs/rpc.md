@@ -839,6 +839,10 @@ Common event types:
 - `irc_message`, `notice`, `goal_updated`
 - `queue_update`
 
+`turn_end.outcome` is required in the native event schema. New clients using
+the generated Go, Python, and Rust bindings require a matching patched host;
+compatibility with older hosts is not claimed.
+
 ### `queue_update` event
 
 ```json

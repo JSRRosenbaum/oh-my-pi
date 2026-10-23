@@ -75,6 +75,7 @@ import { CHAT_MODEL_ROLE_IDS } from "../config/model-roles";
 import type { Settings } from "../config/settings";
 import type { ExtensionRunner, SessionBeforeCompactResult } from "../extensibility/extensions";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
+import type { SessionCompactFailedEvent } from "../extensibility/shared-events";
 import type { GoalModeState } from "../goals/state";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import type { MemoryBackendOperationContext } from "../memory-backend/types";
@@ -438,7 +439,10 @@ export interface SessionMaintenanceHost {
 	takeExperimentalContextRolloverRequest(context: AgentTurnEndContext | undefined): boolean;
 	queueExperimentalContextNotesReminder(prompt: string): void;
 	memoryBackendSession(): MemoryBackendOperationContext["session"];
-	emitSessionEvent(event: AgentSessionEvent, options?: { detachExtensions?: boolean }): Promise<void>;
+	emitSessionEvent(
+		event: AgentSessionEvent | SessionCompactFailedEvent,
+		options?: { detachExtensions?: boolean },
+	): Promise<void>;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
 	scheduleAgentContinue(options: {
 		source: string;
@@ -686,7 +690,7 @@ export class SessionMaintenance {
 	 * fan-out for post-commit events; ordered subscriber delivery still completes
 	 * before maintenance returns.
 	 */
-	#emitLifecycleEvent(event: AgentSessionEvent, detach: boolean): Promise<void> {
+	#emitLifecycleEvent(event: AgentSessionEvent | SessionCompactFailedEvent, detach: boolean): Promise<void> {
 		return this.#host.emitSessionEvent(event, detach ? { detachExtensions: true } : undefined);
 	}
 	/**
@@ -1123,21 +1127,61 @@ export class SessionMaintenance {
 	}
 
 	/**
-	 * Manually compact the session context.
-	 * Aborts current agent operation first.
-	 * @param customInstructions Optional instructions for the compaction summary
-	 * @param options Optional callbacks for completion/error handling
-	 * @param onCommitted Internal: nested fallback frames report their commit to
-	 * the owning frame the moment the entry lands, so a late rejection (a
-	 * `session_compact` hook or `onComplete` throwing after the append) still
-	 * resumes the interrupted turn exactly as the direct path does.
+	 * Compact from the turn-end hook that owns the current agent loop. The
+	 * provider turn is already at its continuation boundary, so persist it and
+	 * rewrite the live loop's messages without aborting/waiting for that loop.
 	 */
+	async compactAtTurnEnd(
+		instructions: string | undefined,
+		options: CompactOptions | undefined,
+		activeMessages: AgentMessage[],
+		context: AgentTurnEndContext,
+		signal: AbortSignal,
+		isOwnerCurrent: () => boolean,
+		isOwnerSessionCurrent: () => boolean,
+	): Promise<CompactionResult> {
+		if (signal.aborted || !isOwnerCurrent()) throw new Error("Turn_end compaction ownership has expired.");
+		if (!(await this.#host.persistTurnMessagesForMidRunCompaction(context))) {
+			throw new Error("Could not persist the turn before extension compaction.");
+		}
+		await this.#host.sessionManager.flush();
+		if (signal.aborted || !isOwnerCurrent()) throw new Error("Turn_end compaction ownership has expired.");
+		let committed = false;
+		try {
+			return await this.compact(
+				instructions,
+				options,
+				0,
+				undefined,
+				() => {
+					committed = true;
+				},
+				true,
+				signal,
+				isOwnerCurrent,
+			);
+		} finally {
+			// Closing the hook revokes permission to start/commit more maintenance,
+			// but the parked loop must still adopt a rewrite that already committed.
+			if (isOwnerSessionCurrent() && (committed || (!signal.aborted && isOwnerCurrent()))) {
+				const compactedMessages = this.#host.agent.state.messages;
+				if (compactedMessages !== activeMessages) {
+					activeMessages.splice(0, activeMessages.length, ...compactedMessages);
+					invalidateConvertToLlmArrayCache(activeMessages);
+				}
+			}
+		}
+	}
+
 	async compact(
 		customInstructions?: string,
 		options?: CompactOptions,
 		methodOffset = 0,
 		retryController?: AbortController,
 		onCommitted?: () => void,
+		ownedTurnEnd = false,
+		ownedTurnSignal?: AbortSignal,
+		ownedTurnIsCurrent?: () => boolean,
 	): Promise<CompactionResult> {
 		const ownsCompactionController = retryController === undefined;
 		if (
@@ -1188,25 +1232,26 @@ export class SessionMaintenance {
 		if (ownsCompactionController) {
 			this.#compactionAbortController = compactionAbortController;
 			this.#manualCompactionCleanup = manualCompactionCleanup?.promise;
-			// A resume still withheld from an earlier pass belongs to this pass now:
-			// the earlier pass's abort already bumped the generation it captured, so
-			// re-decide with this pass's generation instead of stranding the turn.
-			inheritedResume = this.#deferredResumeGeneration !== undefined;
-			this.#deferredResumeGeneration = undefined;
+			if (!ownedTurnEnd) {
+				inheritedResume = this.#deferredResumeGeneration !== undefined;
+				this.#deferredResumeGeneration = undefined;
+			}
 		}
 		// A manual pass supersedes any background speculation; running both would
 		// double-bill the summarizer and race the commit.
 		this.cancelSpeculation();
+		let onOwnedTurnAbort: (() => void) | undefined;
+		if (ownsCompactionController && ownedTurnSignal) {
+			onOwnedTurnAbort = () => compactionAbortController.abort(ownedTurnSignal.reason);
+			if (ownedTurnSignal.aborted) onOwnedTurnAbort();
+			else ownedTurnSignal.addEventListener("abort", onOwnedTurnAbort, { once: true });
+		}
 
+		let fromExtension = false;
 		try {
-			if (ownsCompactionController) {
-				// A manual compaction aborts the live turn, tool loop included. Without a
-				// resume the agent sits idle on a half-finished loop (an autoresearch run,
-				// a pending tool result) until the user types "continue" by hand.
-				// Only a turn the agent actually owns counts: the session-level busy flag
-				// is also true while a prompt is still in async setup (before its message
-				// reaches the agent). The abort bump drops that prompt, so resuming on
-				// its behalf would nudge the model on the previous transcript instead.
+			if (ownsCompactionController && !ownedTurnEnd) {
+				// Ordinary manual compaction aborts the live turn. A turn_end hook is
+				// already at its owning loop's safe continuation boundary.
 				const interruptedActiveTurn = this.#host.agent.state.isStreaming;
 				this.#host.disconnectFromAgent();
 				await this.#host.abort({ goalReason: "internal", preserveCompaction: true });
@@ -1230,6 +1275,7 @@ export class SessionMaintenance {
 					activeModel,
 					compactionAbortController,
 					markCommitted,
+					ownedTurnIsCurrent,
 				);
 				options?.onComplete?.(result);
 				return result;
@@ -1293,6 +1339,9 @@ export class SessionMaintenance {
 					selectedMethodIndex + 1,
 					compactionAbortController,
 					markCommitted,
+					ownedTurnEnd,
+					ownedTurnSignal,
+					ownedTurnIsCurrent,
 				);
 			}
 			const pathEntries = this.#host.sessionManager.getBranch();
@@ -1307,7 +1356,6 @@ export class SessionMaintenance {
 			}
 
 			let hookCompaction: CompactionResult | undefined;
-			let fromExtension = false;
 			let preserveData: Record<string, unknown> | undefined;
 			let providerReplayThroughEntryId: string | undefined;
 
@@ -1548,7 +1596,9 @@ export class SessionMaintenance {
 				});
 			}
 
-			markCommitted();
+			if (ownedTurnEnd && (ownedTurnSignal?.aborted || !ownedTurnIsCurrent?.())) {
+				throw new Error("Turn_end compaction ownership has expired.");
+			}
 			await this.#commitCompactionEntry({
 				summary,
 				shortSummary,
@@ -1561,6 +1611,7 @@ export class SessionMaintenance {
 				codexCompaction,
 				providerReplayThroughEntryId,
 				advisorResetReason: "compact",
+				onCommitted: markCommitted,
 			});
 
 			const compactionResult: CompactionResult = {
@@ -1596,36 +1647,43 @@ export class SessionMaintenance {
 					selectedMethodIndex + 1,
 					compactionAbortController,
 					markCommitted,
+					ownedTurnEnd,
+					ownedTurnSignal,
+					ownedTurnIsCurrent,
+				);
+			}
+			if (!compactionCommitted && !rejectedAsNoOp) {
+				const aborted = compactionAbortController.signal.aborted || error instanceof CompactionCancelledError;
+				await this.#emitLifecycleEvent(
+					{
+						type: "session_compact_failed",
+						reason: "manual",
+						...(!aborted ? { errorMessage: err.message } : {}),
+						aborted,
+						willRetry: false,
+						fromExtension,
+					},
+					false,
 				);
 			}
 			options?.onError?.(err);
 			throw error;
 		} finally {
 			if (ownsCompactionController) {
+				if (onOwnedTurnAbort) ownedTurnSignal?.removeEventListener("abort", onOwnedTurnAbort);
 				if (this.#compactionAbortController === compactionAbortController) {
 					this.#compactionAbortController = undefined;
 				}
-				this.#host.reconnectToAgent();
-				// Compaction disconnected before `await abort()`, so abort's finally drain
-				// (and any steer/follow-up that arrived mid-compaction — async IRC, an
-				// `xd://` mount notice, an SDK/RPC steer) was suppressed while disconnected
-				// (issue #5800). Unlike `/new`/switchSession, compaction preserves the agent
-				// queues, so nothing else resumes them: re-drain now that the listener is back
-				// and `isCompacting` is false, or the queued turn hangs until the next prompt.
-				this.#host.drainStrandedQueuedMessages();
+				if (!ownedTurnEnd) {
+					this.#host.reconnectToAgent();
+					this.#host.drainStrandedQueuedMessages();
+				}
 				if (this.#manualCompactionCleanup === manualCompactionCleanup?.promise) {
 					this.#manualCompactionCleanup = undefined;
 				}
 				manualCompactionCleanup?.resolve();
-				// An inherited resume was earned by the pass that committed it; this
-				// pass's own outcome (hook cancel, summarizer failure) only decides the
-				// turn it interrupted itself, so the inherited one stays owed.
 				if ((compactionCommitted || rejectedAsNoOp || inheritedResume) && resumeInterruptedTurn) {
 					if (this.#promptsAwaitingCleanup > 0) {
-						// A prompt parked on the barrier just resolved is the user's next
-						// intent and takes the session instead (its continuation is a
-						// microtask away). It reports back via `release`: a turn drops the
-						// resume, a locally handled command hands it back.
 						this.#deferredResumeGeneration = interruptedTurnGeneration;
 					} else {
 						this.#scheduleInterruptedTurnResume(interruptedTurnGeneration);
@@ -1644,6 +1702,7 @@ export class SessionMaintenance {
 		model: Model,
 		signalController: AbortController,
 		onCommitted: () => void,
+		ownedTurnIsCurrent?: () => boolean,
 	): Promise<CompactionResult> {
 		const entries = this.#host.sessionManager.getBranch();
 		const settings = this.#compactionSettings;
@@ -1714,17 +1773,16 @@ export class SessionMaintenance {
 						details: { kind: "experimental-context-rollover", version: 1 },
 						preserveData: prepared.preserveData,
 					};
-		// Report before `#commitCompactionEntry`, as the direct path does: it appends
-		// the entry and then awaits post-append bookkeeping and the `session_compact`
-		// hook, and a rejection there must still count as committed for the
-		// interrupted-turn resume.
-		onCommitted();
+		if (ownedTurnIsCurrent && (signalController.signal.aborted || !ownedTurnIsCurrent())) {
+			throw new Error("Turn_end compaction ownership has expired.");
+		}
 		await this.#commitCompactionEntry({
 			...result,
 			fromExtension,
 			method: undefined,
 			codexCompaction: undefined,
 			advisorResetReason: "experimental-context-rollover",
+			onCommitted,
 		});
 		this.#experimentalNotesReminderBoundaryId = undefined;
 		return {
@@ -1769,6 +1827,34 @@ export class SessionMaintenance {
 		const terminalTextAnswer =
 			options.terminalTextAnswer ?? isTerminalTextAssistantAnswer(this.#host.findLastAssistantMessage());
 		const detachPostCommit = options.detachPostCommit === true;
+		let beforeCompactStarted = false;
+		let autoCompactionEnded = false;
+		let compactionCommitted = false;
+		let fromExtension = false;
+		const emitAutoCompactionEnd = async (
+			event: Extract<AgentSessionEvent, { type: "auto_compaction_end" }>,
+		): Promise<void> => {
+			if (autoCompactionEnded) return;
+			autoCompactionEnded = true;
+			try {
+				await this.#emitLifecycleEvent(event, detachPostCommit);
+			} finally {
+				if (event.result === undefined && beforeCompactStarted && !compactionCommitted) {
+					beforeCompactStarted = false;
+					await this.#emitLifecycleEvent(
+						{
+							type: "session_compact_failed",
+							reason,
+							...(event.errorMessage !== undefined ? { errorMessage: event.errorMessage } : {}),
+							aborted: event.aborted,
+							willRetry: event.willRetry,
+							fromExtension,
+						},
+						detachPostCommit,
+					);
+				}
+			}
+		};
 		try {
 			await this.#emitLifecycleEvent({ type: "auto_compaction_start", reason, action: "context-full" }, false);
 			if (controller.signal.aborted) {
@@ -1786,8 +1872,8 @@ export class SessionMaintenance {
 			}
 
 			let hookCompaction: CompactionResult | undefined;
-			let fromExtension = false;
 			if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
+				beforeCompactStarted = true;
 				const hookResult = (await this.#host.extensionRunner.emit({
 					type: "session_before_compact",
 					preparation,
@@ -1796,16 +1882,13 @@ export class SessionMaintenance {
 					signal: controller.signal,
 				})) as SessionBeforeCompactResult | undefined;
 				if (hookResult?.cancel) {
-					await this.#emitLifecycleEvent(
-						{
-							type: "auto_compaction_end",
-							action: "context-full",
-							result: undefined,
-							aborted: true,
-							willRetry: false,
-						},
-						detachPostCommit,
-					);
+					await emitAutoCompactionEnd({
+						type: "auto_compaction_end",
+						action: "context-full",
+						result: undefined,
+						aborted: true,
+						willRetry: false,
+					});
 					return COMPACTION_CHECK_NONE;
 				}
 				if (hookResult?.compaction) {
@@ -1814,17 +1897,14 @@ export class SessionMaintenance {
 				}
 			}
 			if (controller.signal.aborted || !this.#usesExperimentalContextManagement()) {
-				await this.#emitLifecycleEvent(
-					{
-						type: "auto_compaction_end",
-						action: "context-full",
-						result: undefined,
-						aborted: controller.signal.aborted,
-						willRetry: false,
-						skipped: !controller.signal.aborted,
-					},
-					detachPostCommit,
-				);
+				await emitAutoCompactionEnd({
+					type: "auto_compaction_end",
+					action: "context-full",
+					result: undefined,
+					aborted: controller.signal.aborted,
+					willRetry: false,
+					skipped: !controller.signal.aborted,
+				});
 				return COMPACTION_CHECK_NONE;
 			}
 
@@ -1838,17 +1918,14 @@ export class SessionMaintenance {
 				this.#host.sessionManager.getBranch().at(-1)?.id !== sourceLeafId ||
 				(this.#model && `${this.#model.provider}/${this.#model.id}` !== sourceModel)
 			) {
-				await this.#emitLifecycleEvent(
-					{
-						type: "auto_compaction_end",
-						action: "context-full",
-						result: undefined,
-						aborted: controller.signal.aborted,
-						willRetry: false,
-						skipped: !controller.signal.aborted,
-					},
-					detachPostCommit,
-				);
+				await emitAutoCompactionEnd({
+					type: "auto_compaction_end",
+					action: "context-full",
+					result: undefined,
+					aborted: controller.signal.aborted,
+					willRetry: false,
+					skipped: !controller.signal.aborted,
+				});
 				return COMPACTION_CHECK_NONE;
 			}
 			const result =
@@ -1881,6 +1958,10 @@ export class SessionMaintenance {
 				codexCompaction: undefined,
 				advisorResetReason: "experimental-context-rollover",
 				detachExtensionEmit: detachPostCommit,
+				failureReason: reason,
+				onCommitted: () => {
+					compactionCommitted = true;
+				},
 			});
 			this.#experimentalNotesReminderBoundaryId = undefined;
 
@@ -1891,16 +1972,13 @@ export class SessionMaintenance {
 			const safeToContinue = willRetry
 				? this.#compactionCreatedRetryFit()
 				: reason === "idle" || this.#compactionCreatedHeadroom();
-			await this.#emitLifecycleEvent(
-				{
-					type: "auto_compaction_end",
-					action: "context-full",
-					result: compactionResult,
-					aborted: false,
-					willRetry,
-				},
-				detachPostCommit,
-			);
+			await emitAutoCompactionEnd({
+				type: "auto_compaction_end",
+				action: "context-full",
+				result: compactionResult,
+				aborted: false,
+				willRetry,
+			});
 			if (!safeToContinue) {
 				const warning = this.#compactionDeadEndWarning("clear large tool output");
 				const entry = getLatestCompactionEntry(this.#host.sessionManager.getBranch());
@@ -1928,17 +2006,14 @@ export class SessionMaintenance {
 				? COMPACTION_CHECK_CONTINUATION
 				: COMPACTION_CHECK_NONE;
 		} catch (error) {
-			await this.#emitLifecycleEvent(
-				{
-					type: "auto_compaction_end",
-					action: "context-full",
-					result: undefined,
-					aborted: controller.signal.aborted,
-					willRetry: false,
-					errorMessage: error instanceof Error ? error.message : String(error),
-				},
-				detachPostCommit,
-			);
+			await emitAutoCompactionEnd({
+				type: "auto_compaction_end",
+				action: "context-full",
+				result: undefined,
+				aborted: controller.signal.aborted || error instanceof CompactionCancelledError,
+				willRetry: false,
+				errorMessage: error instanceof Error ? error.message : String(error),
+			});
 			throw error;
 		} finally {
 			if (this.#autoCompactionAbortController === controller) {
@@ -2480,6 +2555,8 @@ export class SessionMaintenance {
 		providerReplayThroughEntryId?: string;
 		advisorResetReason: string;
 		detachExtensionEmit?: boolean;
+		onCommitted?: () => void;
+		failureReason?: SessionCompactFailedEvent["reason"];
 	}): Promise<CompactionEntry | undefined> {
 		const entryId = this.#host.sessionManager.appendCompaction(
 			args.summary,
@@ -2498,44 +2575,64 @@ export class SessionMaintenance {
 						: this.#projectCompactedContextTokens(args),
 			},
 		);
-		this.#host.persistEvalStateContext();
-		// A committed compaction starts a new cycle; native compaction gets a fresh try.
-		this.#failedNativeSpeculation = undefined;
-		const newEntries = this.#host.sessionManager.getEntries();
-		const sessionContext = this.#host.buildDisplaySessionContext();
-		this.#host.agent.replaceMessages(sessionContext.messages);
-		this.#host.rebaseAfterCompaction();
-		// Compaction discarded the conversation history that carried the approved
-		// plan reference. Clear the sent-flag so #buildPlanReferenceMessage re-reads
-		// the plan from disk and re-injects it on the next turn (issue #1246).
-		this.#host.resetPlanReference();
-		this.#host.resetAdvisorRuntimes(args.advisorResetReason, { compacted: true });
-		this.#host.syncTodoPhasesFromBranch();
-		if (args.codexCompaction) {
-			this.#host.resetCodexProviderAfterCompaction(args.codexCompaction);
-		} else {
-			this.#host.closeCodexProviderSessionsForHistoryRewrite();
-		}
-		const savedCompactionEntry = newEntries.find(e => e.type === "compaction" && e.id === entryId) as
-			| CompactionEntry
-			| undefined;
-		if (this.#host.extensionRunner && savedCompactionEntry) {
-			const compactEmit = this.#host.extensionRunner.emit({
-				type: "session_compact",
-				compactionEntry: savedCompactionEntry,
-				fromExtension: args.fromExtension,
-			});
-			if (args.detachExtensionEmit) {
-				void compactEmit.catch(error => {
-					logger.warn("Detached session_compact emit failed", {
-						error: error instanceof Error ? error.message : String(error),
-					});
-				});
+		args.onCommitted?.();
+		let lifecycleDelivered = false;
+		try {
+			this.#host.persistEvalStateContext();
+			// A committed compaction starts a new cycle; native compaction gets a fresh try.
+			this.#failedNativeSpeculation = undefined;
+			const newEntries = this.#host.sessionManager.getEntries();
+			const sessionContext = this.#host.buildDisplaySessionContext();
+			this.#host.agent.replaceMessages(sessionContext.messages);
+			this.#host.rebaseAfterCompaction();
+			// Re-inject the approved plan reference after its previous context is discarded.
+			this.#host.resetPlanReference();
+			this.#host.resetAdvisorRuntimes(args.advisorResetReason, { compacted: true });
+			this.#host.syncTodoPhasesFromBranch();
+			if (args.codexCompaction) {
+				this.#host.resetCodexProviderAfterCompaction(args.codexCompaction);
 			} else {
-				await compactEmit;
+				this.#host.closeCodexProviderSessionsForHistoryRewrite();
 			}
+			const savedCompactionEntry = newEntries.find(e => e.type === "compaction" && e.id === entryId) as
+				| CompactionEntry
+				| undefined;
+			if (this.#host.extensionRunner && savedCompactionEntry) {
+				lifecycleDelivered = true;
+				const compactEmit = this.#host.extensionRunner.emit({
+					type: "session_compact",
+					compactionEntry: savedCompactionEntry,
+					fromExtension: args.fromExtension,
+				});
+				if (args.detachExtensionEmit) {
+					void compactEmit.catch(error => {
+						logger.warn("Detached session_compact emit failed", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					});
+				} else {
+					await compactEmit;
+				}
+			}
+			return savedCompactionEntry;
+		} catch (error) {
+			// Durable append and successful lifecycle delivery are distinct: a
+			// bookkeeping failure must release consumers without retrying the rewrite.
+			if (!lifecycleDelivered) {
+				await this.#emitLifecycleEvent(
+					{
+						type: "session_compact_failed",
+						reason: args.failureReason ?? "manual",
+						errorMessage: error instanceof Error ? error.message : String(error),
+						aborted: false,
+						willRetry: false,
+						fromExtension: args.fromExtension,
+					},
+					args.detachExtensionEmit === true,
+				);
+			}
+			throw error;
 		}
-		return savedCompactionEntry;
 	}
 
 	/**
@@ -4831,6 +4928,46 @@ export class SessionMaintenance {
 		const autoCompactionSignal = autoCompactionAbortController.signal;
 
 		let compactionCommitted = false;
+		let fromExtension = false;
+		let beforeCompactStarted = false;
+		let autoCompactionEnded = false;
+		const emitCompactFailed = (details: {
+			errorMessage?: string;
+			aborted: boolean;
+			willRetry: boolean;
+			fromExtension: boolean;
+		}): Promise<void> => {
+			if (!beforeCompactStarted || compactionCommitted) return Promise.resolve();
+			beforeCompactStarted = false;
+			return this.#emitLifecycleEvent(
+				{
+					type: "session_compact_failed",
+					reason,
+					...details,
+				},
+				options.detachPostCommit === true,
+			);
+		};
+		const emitAutoCompactionEnd = async (
+			event: Extract<AgentSessionEvent, { type: "auto_compaction_end" }>,
+			detach: boolean,
+			willRetry = event.willRetry,
+		): Promise<void> => {
+			if (autoCompactionEnded) return;
+			autoCompactionEnded = true;
+			try {
+				await this.#emitLifecycleEvent(event, detach);
+			} finally {
+				if (event.result === undefined) {
+					await emitCompactFailed({
+						...(event.errorMessage !== undefined ? { errorMessage: event.errorMessage } : {}),
+						aborted: event.aborted,
+						willRetry,
+						fromExtension,
+					});
+				}
+			}
+		};
 		try {
 			// Emit start AFTER the controller is installed so isCompacting is already true
 			// for any listener — and for input routed during this emit's event-loop yield:
@@ -4876,6 +5013,7 @@ export class SessionMaintenance {
 					fallbackFromShake,
 					detachPostCommit: options.detachPostCommit === true,
 					autoCompactionSignal,
+					emitAutoCompactionEnd: event => emitAutoCompactionEnd(event, options.detachPostCommit === true),
 					onCommitted: () => {
 						compactionCommitted = true;
 					},
@@ -5055,12 +5193,12 @@ export class SessionMaintenance {
 			}
 
 			let hookCompaction: CompactionResult | undefined;
-			let fromExtension = false;
 			let preserveData: Record<string, unknown> | undefined;
 			let codexCompaction: CodexCompactionContext | undefined;
 			let providerReplayThroughEntryId: string | undefined;
 
 			if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
+				beforeCompactStarted = true;
 				const hookResult = (await this.#host.extensionRunner.emit({
 					type: "session_before_compact",
 					preparation,
@@ -5070,14 +5208,8 @@ export class SessionMaintenance {
 				})) as SessionBeforeCompactResult | undefined;
 
 				if (hookResult?.cancel) {
-					await this.#emitLifecycleEvent(
-						{
-							type: "auto_compaction_end",
-							action,
-							result: undefined,
-							aborted: true,
-							willRetry: false,
-						},
+					await emitAutoCompactionEnd(
+						{ type: "auto_compaction_end", action, result: undefined, aborted: true, willRetry: false },
 						options.detachPostCommit === true,
 					);
 					return COMPACTION_CHECK_NONE;
@@ -5102,14 +5234,8 @@ export class SessionMaintenance {
 					signal: autoCompactionSignal,
 				});
 				if (autoCompactionSignal.aborted) {
-					await this.#emitLifecycleEvent(
-						{
-							type: "auto_compaction_end",
-							action,
-							result: undefined,
-							aborted: true,
-							willRetry: false,
-						},
+					await emitAutoCompactionEnd(
+						{ type: "auto_compaction_end", action, result: undefined, aborted: true, willRetry: false },
 						options.detachPostCommit === true,
 					);
 					return COMPACTION_CHECK_NONE;
@@ -5118,7 +5244,7 @@ export class SessionMaintenance {
 					logger.warn("Auto-handoff returned no document; trying next preferred compaction method", {
 						reason,
 					});
-					await this.#emitLifecycleEvent(
+					await emitAutoCompactionEnd(
 						{
 							type: "auto_compaction_end",
 							action,
@@ -5128,6 +5254,7 @@ export class SessionMaintenance {
 							errorMessage: "Auto-handoff returned no document; trying the next preferred compaction method.",
 						},
 						options.detachPostCommit === true,
+						true,
 					);
 					return await this.runAutoCompaction(reason, willRetry, {
 						...options,
@@ -5299,7 +5426,7 @@ export class SessionMaintenance {
 				}
 				if (snapcompactBlocker) {
 					this.#host.emitNotice("warning", snapcompactBlocker, "compaction");
-					await this.#emitLifecycleEvent(
+					await emitAutoCompactionEnd(
 						{
 							type: "auto_compaction_end",
 							action,
@@ -5309,6 +5436,7 @@ export class SessionMaintenance {
 							errorMessage: snapcompactBlocker,
 						},
 						options.detachPostCommit === true,
+						true,
 					);
 					return await this.runAutoCompaction(reason, willRetry, {
 						...options,
@@ -5566,20 +5694,15 @@ export class SessionMaintenance {
 				fallbackFromShake,
 				detachPostCommit: options.detachPostCommit === true,
 				autoCompactionSignal,
+				emitAutoCompactionEnd: event => emitAutoCompactionEnd(event, options.detachPostCommit === true),
 				onCommitted: () => {
 					compactionCommitted = true;
 				},
 			});
 		} catch (error) {
-			if (autoCompactionSignal.aborted) {
-				await this.#emitLifecycleEvent(
-					{
-						type: "auto_compaction_end",
-						action,
-						result: undefined,
-						aborted: true,
-						willRetry: false,
-					},
+			if (autoCompactionSignal.aborted || error instanceof CompactionCancelledError) {
+				await emitAutoCompactionEnd(
+					{ type: "auto_compaction_end", action, result: undefined, aborted: true, willRetry: false },
 					options.detachPostCommit === true,
 				);
 				return COMPACTION_CHECK_NONE;
@@ -5596,7 +5719,7 @@ export class SessionMaintenance {
 					method,
 					error: errorMessage,
 				});
-				await this.#emitLifecycleEvent(
+				await emitAutoCompactionEnd(
 					{
 						type: "auto_compaction_end",
 						action,
@@ -5606,13 +5729,14 @@ export class SessionMaintenance {
 						errorMessage: `${contextErrorMessage}; trying the next preferred compaction method.`,
 					},
 					options.detachPostCommit === true,
+					true,
 				);
 				return await this.runAutoCompaction(reason, willRetry, {
 					...options,
 					methodIndex: methodIndex + 1,
 				});
 			}
-			await this.#emitLifecycleEvent(
+			await emitAutoCompactionEnd(
 				{
 					type: "auto_compaction_end",
 					action,
@@ -5659,24 +5783,21 @@ export class SessionMaintenance {
 		fallbackFromShake: boolean;
 		detachPostCommit: boolean;
 		autoCompactionSignal: AbortSignal;
+		emitAutoCompactionEnd: (event: Extract<AgentSessionEvent, { type: "auto_compaction_end" }>) => Promise<void>;
 		onCommitted: () => void;
 	}): Promise<CompactionCheckResult> {
 		const { action, reason, willRetry, detachPostCommit, autoCompactionSignal } = args;
 		if (autoCompactionSignal.aborted) {
-			await this.#emitLifecycleEvent(
-				{
-					type: "auto_compaction_end",
-					action,
-					result: undefined,
-					aborted: true,
-					willRetry: false,
-				},
-				detachPostCommit,
-			);
+			await args.emitAutoCompactionEnd({
+				type: "auto_compaction_end",
+				action,
+				result: undefined,
+				aborted: true,
+				willRetry: false,
+			});
 			return COMPACTION_CHECK_NONE;
 		}
 
-		args.onCommitted();
 		const savedCompactionEntry = await this.#commitCompactionEntry({
 			summary: args.summary,
 			shortSummary: args.shortSummary,
@@ -5690,6 +5811,8 @@ export class SessionMaintenance {
 			providerReplayThroughEntryId: args.providerReplayThroughEntryId,
 			advisorResetReason: "auto-compaction",
 			detachExtensionEmit: detachPostCommit,
+			failureReason: reason,
+			onCommitted: args.onCommitted,
 		});
 
 		const result: CompactionResult = {
@@ -5794,10 +5917,7 @@ export class SessionMaintenance {
 			}
 		}
 
-		await this.#emitLifecycleEvent(
-			{ type: "auto_compaction_end", action, result, aborted: false, willRetry },
-			detachPostCommit,
-		);
+		await args.emitAutoCompactionEnd({ type: "auto_compaction_end", action, result, aborted: false, willRetry });
 
 		if (retryFits) {
 			this.#host.scheduleAgentContinue({

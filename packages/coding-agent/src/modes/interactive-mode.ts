@@ -82,6 +82,9 @@ import { restartArgv } from "../cli/flag-tables";
 import type { CollabGuestLink } from "../collab/guest";
 import { CollabController } from "../collab/controller";
 import type { CollabHost } from "../collab/host";
+import { RemoteDialogHosts } from "./remote-dialogs";
+import type { CollabUiRequestDraft } from "@oh-my-pi/pi-wire";
+import type { RemoteDialogHost, RemoteDialogRequest, RemoteDialogResponse } from "./remote-dialogs";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import { appKey, editorKey, rawKeyHint } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
 import { formatModelString, type ResolvedModelRoleValue } from "../config/model-resolver";
@@ -1616,7 +1619,56 @@ export class InteractiveMode implements InteractiveModeContext {
 	/** Owns hosting: manual `/collab`, `collab.autoStart`, and room rotation on session switch. */
 	readonly collabController: CollabController;
 	/** Owned room; use {@link collabController}.host for current-session reuse and links. */
-	collabHost?: CollabHost;
+	#collabHost: CollabHost | undefined;
+	#unregisterCollabDialogHost: (() => void) | undefined;
+	readonly remoteDialogHosts: RemoteDialogHosts;
+	get collabHost(): CollabHost | undefined {
+		return this.#collabHost;
+	}
+
+	set collabHost(host: CollabHost | undefined) {
+		if (host === this.#collabHost) return;
+		this.#collabHost = host;
+		this.#registerCollabDialogHost();
+	}
+
+	#registerCollabDialogHost(): void {
+		this.#unregisterCollabDialogHost?.();
+		const host = this.#collabHost;
+		if (!host) {
+			this.#unregisterCollabDialogHost = undefined;
+			return;
+		}
+		const adapter: RemoteDialogHost = {
+			request: (request: RemoteDialogRequest, signal: AbortSignal): Promise<RemoteDialogResponse> | null => {
+				let draft: CollabUiRequestDraft;
+				switch (request.kind) {
+					case "select":
+					case "editor": {
+						const { provenance: _provenance, ...wireRequest } = request;
+						draft = wireRequest;
+						break;
+					}
+					case "confirm":
+						draft = {
+							kind: "select",
+							title: `${request.title}\n${request.message}`,
+							options: [{ label: "Yes" }, { label: "No" }],
+						};
+						break;
+					case "input":
+					case "ask":
+						return null;
+				}
+				const pending = host.requestGuestUi(draft, signal);
+				if (!pending || request.kind !== "confirm") return pending;
+				return pending.then((result): RemoteDialogResponse =>
+					result.kind === "unavailable" ? result : { kind: "answered", value: result.value === "Yes" },
+				);
+			},
+		};
+		this.#unregisterCollabDialogHost = this.remoteDialogHosts.register(adapter);
+	}
 	collabGuest?: CollabGuestLink;
 	#streamPublisher: StreamPublisher | undefined;
 	#recorder: SessionRecorder | undefined;
@@ -1682,6 +1734,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#planReviewOwner: object | undefined;
 	#planReviewCancel: (() => void) | undefined;
 	#planReviewPick: ((choice: string) => boolean) | undefined;
+	#activePlanReviewContinuations = new Set<{ invalidated: boolean }>();
 	/** Runs once when the open review's overlay is hidden; set by `showPlanReview`'s `onClose`. */
 	#planReviewOnHide: (() => void) | undefined;
 	/** The open review awaiting an answer; cleared as soon as a local or remote pick settles it. */
@@ -2106,6 +2159,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#focusController = new SessionFocusController(this);
 		this.#inputController = new InputController(this);
 		this.collabController = new CollabController(this);
+		this.remoteDialogHosts = new RemoteDialogHosts(this.sessionManager.getSessionId());
 		this.session.setPromptDropped?.(prompt => this.#restoreDroppedPrompt(prompt));
 		this.#observerRegistry = new SessionObserverRegistry();
 	}
@@ -2202,9 +2256,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	async init(options: InteractiveModeInitOptions = {}): Promise<void> {
 		if (this.isInitialized) return;
 
-		// Fresh dialog lifetime: a previous stop (if this mode is ever
-		// re-initialized) left the old controller aborted, and approvals queued
-		// behind the approval mutex must prompt on a live signal, not a dead one.
+		// Refresh both dialog lifetimes before startup extension handlers can ask for UI.
+		this.#extensionUiController.advanceSessionDialogs();
 		this.#dialogLifetime.abort();
 		this.#dialogLifetime = new AbortController();
 
@@ -2555,6 +2608,30 @@ export class InteractiveMode implements InteractiveModeContext {
 		// startup; early dialog answers do not require that readiness signal.
 		if (options.autoStartCollab === true) this.collabController.autoStart();
 
+		if (this.session.extensionRunner) {
+			this.#eventBusUnsubscribers.push(
+				this.session.extensionRunner.onSessionLifecycle(event => {
+					if (event.type === "session_shutdown") {
+						this.#dialogLifetime.abort();
+						if (event.reason === "quit") {
+							this.#extensionUiController.disposeSessionDialogs();
+							this.remoteDialogHosts.dispose();
+						} else {
+							this.#extensionUiController.advanceSessionDialogs();
+							this.remoteDialogHosts.abortCurrentGeneration();
+							this.#registerCollabDialogHost();
+							this.#dialogLifetime = new AbortController();
+						}
+						return;
+					}
+					this.#extensionUiController.advanceSessionDialogs();
+					this.#dialogLifetime.abort();
+					this.remoteDialogHosts.advanceGeneration(this.sessionManager.getSessionId());
+					this.#registerCollabDialogHost();
+					this.#dialogLifetime = new AbortController();
+				}),
+			);
+		}
 		// Initialize hooks with TUI-based UI context
 		await logger.time("InteractiveMode.init:hooks", () => this.initHooksAndCustomTools());
 
@@ -5276,7 +5353,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		paused?: boolean;
 		deferModelRestore?: boolean;
 		interruptActiveTurn?: boolean;
+		reviewOwner?: { invalidated: boolean };
 	}): Promise<void> {
+		// Cancel unanswered reviews and accepted-but-not-dispatched continuations.
+		// Only the approval performing this transition may retain its own continuation.
+		this.#invalidatePlanReviews(options?.reviewOwner);
 		if (!this.planModeEnabled) {
 			return;
 		}
@@ -5597,6 +5678,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#planReviewOwner = undefined;
 		onHide?.();
 	}
+	#invalidatePlanReviews(preserve?: { invalidated: boolean }): void {
+		for (const review of this.#activePlanReviewContinuations) {
+			if (review !== preserve) review.invalidated = true;
+		}
+		if (!preserve) this.#hidePlanReview();
+	}
 
 	/** The open plan review awaiting an answer, as `plan_review_requested` reported it: backs `ctx.getPendingPlanReview`. */
 	getPendingPlanReview(): PlanReviewRequestedEvent | undefined {
@@ -5898,7 +5985,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			preserveContext?: boolean;
 			compactBeforeExecute?: boolean;
 			executionModel?: ResolvedRoleModel;
-			reviewOwner: object;
+			reviewOwner: { invalidated: boolean };
+			reviewOverlayOwner: object;
 		},
 	): Promise<boolean> {
 		const previousPresentation = this.#planModePreviousToolPresentation ?? {
@@ -5921,15 +6009,20 @@ export class InteractiveMode implements InteractiveModeContext {
 				silent: true,
 				paused: false,
 				deferModelRestore: options.compactBeforeExecute === true,
+				reviewOwner: options.reviewOwner,
 			});
+			if (options.reviewOwner.invalidated) return false;
 
 			if (!options.preserveContext) {
 				const oldLocalRoot = this.#resolveLocalRoot();
-				await this.handleClearCommand();
+				await this.handleClearCommand(options.reviewOwner);
+				if (options.reviewOwner.invalidated) return false;
 				const newLocalRoot = this.#resolveLocalRoot();
 				await copyLocalArtifacts(oldLocalRoot, newLocalRoot);
+				if (options.reviewOwner.invalidated) return false;
 				const newLocalPath = this.#resolvePlanFilePath(options.planFilePath);
 				await fs.mkdir(path.dirname(newLocalPath), { recursive: true });
+				if (options.reviewOwner.invalidated) return false;
 				await fs.writeFile(newLocalPath, planContent);
 			} else if (options.compactBeforeExecute) {
 				// Distill the plan-mode transcript before the execution turn is queued so
@@ -5968,6 +6061,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			// message_end stamping. Guarantees the flag is dead at every exit.
 			this.session.clearPlanInternalAbortPending();
 		}
+		if (options.reviewOwner.invalidated) return false;
 
 		// Restore the execution tool set, but force-enable `read` so the durable
 		// local:// plan remains available if the inline copy becomes unrecoverable.
@@ -5975,6 +6069,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			? previousPresentation.enabled
 			: [...previousPresentation.enabled, "read"];
 		await this.session.restoreNonMCPToolPresentation(executionTools, previousPresentation.mounted);
+		if (options.reviewOwner.invalidated) return false;
 		this.session.setPlanReferencePath(options.planFilePath);
 		try {
 			const autosaved = await autosaveApprovedPlan({
@@ -5998,6 +6093,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			);
 			this.showWarning(`Failed to autosave plan: ${detail}`);
 		}
+		if (options.reviewOwner.invalidated) return false;
 
 		// Resolve the deferred plan-approval model transition. On the compact path
 		// the before-flush hook passed to handleCompactCommand already ran this (so
@@ -6012,6 +6108,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		} else {
 			await this.#applyPlanExecutionModel(options.executionModel);
 		}
+		if (options.reviewOwner.invalidated) return false;
 
 		if (compactOutcome === "cancelled") {
 			// Explicit abort: honor it. `executeCompaction` already surfaced
@@ -6035,6 +6132,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (seededName && !this.sessionManager.getSessionName()) {
 			await this.sessionManager.setSessionName(seededName, "auto");
 		}
+		if (options.reviewOwner.invalidated) return false;
 
 		// markPlanReferenceSent fires only on the dispatch path so the synthetic
 		// plan-approved prompt is the source of the reference injection.
@@ -6055,7 +6153,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// The ownership-bound hide is idempotent, so the caller's trailing
 		// `closePlanReview()` — and a stale continuation after a replacement review
 		// opened — stay safe no-ops.
-		this.#hidePlanReview(options.reviewOwner);
+		this.#hidePlanReview(options.reviewOverlayOwner);
 		this.ui.requestRender();
 		// A user turn queued during compaction was already fired by
 		// `flushCompactionQueue` before we returned from `handleCompactCommand`; the
@@ -6088,6 +6186,41 @@ export class InteractiveMode implements InteractiveModeContext {
 		} finally {
 			this.session.clearPlanInternalAbortPending();
 		}
+	}
+
+	getPlanMode(): "active" | "paused" | "off" {
+		if (this.planModeEnabled) return "active";
+		return this.planModePaused ? "paused" : "off";
+	}
+
+	async setPlanMode(action: "enter" | "pause" | "exit", options?: { confirmed?: boolean }): Promise<boolean> {
+		const current = this.getPlanMode();
+		if (action === "enter") {
+			if (current === "active") return true;
+			if (!cfgPlanEnabled.get(this.session.settings)) return false;
+			if (this.goalModeEnabled || this.goalModePaused || this.vibeModeEnabled || this.#vibeModeEntry !== undefined)
+				return false;
+			await this.#enterPlanMode();
+			return this.getPlanMode() === "active";
+		}
+		if (current === "off") return false;
+		const planFilePath = this.planModePlanFilePath ?? (await this.#getPlanFilePath());
+		if (!options?.confirmed && (await this.#hasPlanModeDraftContent(planFilePath))) return false;
+		if (action === "pause") {
+			if (current === "paused") return true;
+			await this.#exitPlanMode({ paused: true, interruptActiveTurn: true });
+			return this.getPlanMode() === "paused";
+		}
+		if (current === "active") {
+			await this.#exitPlanMode({ interruptActiveTurn: true });
+			return this.getPlanMode() === "off";
+		}
+		this.planModePaused = false;
+		this.#planModeHasEntered = false;
+		this.#updatePlanModeStatus();
+		this.sessionManager.appendModeChange("none");
+		this.showStatus("Plan mode disabled.");
+		return this.getPlanMode() === "off";
 	}
 
 	async handlePlanModeCommand(
@@ -6907,6 +7040,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				: undefined,
 		};
 		const reviewId = request.reviewId;
+		this.#invalidatePlanReviews();
+		const reviewOwner = { invalidated: false };
+		this.#activePlanReviewContinuations.add(reviewOwner);
 		this.#pendingPlanReview = {
 			request,
 			// Mirrors the slider's onChange for remote answers: a pick in `resolvePlanReview`
@@ -6976,11 +7112,19 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#hidePlanReview(pending);
 			this.ui.requestRender();
 		};
+		const finishReview = (): void => {
+			this.#activePlanReviewContinuations.delete(reviewOwner);
+			closePlanReview();
+		};
+		if (reviewOwner.invalidated) {
+			finishReview();
+			return;
+		}
 
 		if (choice === PLAN_SAVE_AND_QUIT_OPTION) {
-			closePlanReview();
 			try {
 				const latestPlanContent = editedContent ?? (await this.#readPlanFile(planFilePath));
+				if (reviewOwner.invalidated) return;
 				if (latestPlanContent === null) {
 					this.showError(`Plan file not found at ${planFilePath}`);
 					return;
@@ -6992,42 +7136,28 @@ export class InteractiveMode implements InteractiveModeContext {
 					remote?.choice === "save" ? planSaveFileName(details.title) : undefined,
 				);
 			} catch (error) {
-				this.showError(`Failed to save plan: ${error instanceof Error ? error.message : String(error)}`);
+				if (!reviewOwner.invalidated) {
+					this.showError(`Failed to save plan: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			} finally {
+				this.#activePlanReviewContinuations.delete(reviewOwner);
+				closePlanReview();
 			}
 			return;
 		}
 
 		if (choice === "Approve and execute" || choice === "Approve and compact context" || choice === keepContextLabel) {
 			try {
-				// Prefer in-overlay edits (already in memory) over a disk re-read. The
-				// overlay mirrors edits as they happen, and approval awaits one final
-				// write so the durable plan file and synthetic prompt carry the same text.
 				const latestPlanContent = editedContent ?? (await this.#readPlanFile(planFilePath));
+				if (reviewOwner.invalidated) return;
 				if (editedContent !== undefined) {
 					await Bun.write(this.#resolvePlanFilePath(planFilePath), editedContent);
+					if (reviewOwner.invalidated) return;
 				}
 				if (!latestPlanContent) {
 					this.showError(`Plan file not found at ${planFilePath}`);
-					closePlanReview();
 					return;
 				}
-				// Capture the operator's tier choice and hand it to #approvePlan, which
-				// applies it AFTER #exitPlanMode. #exitPlanMode normally restores
-				// #planModePreviousModelState (the model from before plan mode), so
-				// applying the slider choice any earlier would be silently reverted.
-				// Pass executionModel only when the slider was actually shown — a
-				// singleton cycle (e.g. only modelRoles.plan is configured, so
-				// getRoleModelCycle synthesizes a lone `default` entry from the
-				// currently active plan model) hides the slider, the operator made
-				// no selection, and the pre-plan model is not in the cycle. Pinning
-				// that singleton would silently switch the session back to the plan
-				// model after #exitPlanMode restored the pre-plan model.
-				// Treat the choice as implicit only when applying the selected role
-				// would land on the same end state as the restore — same model AND
-				// the same effective thinking level. A role with an explicit thinking
-				// suffix that differs from the restored thinking level must still go
-				// through applyRoleModel, otherwise approving on the same model with a
-				// different configured thinking level silently keeps the pre-plan level.
 				const restoredState = this.#planModePreviousModelState;
 				const restoredIndex =
 					cycle && restoredState
@@ -7045,42 +7175,51 @@ export class InteractiveMode implements InteractiveModeContext {
 					preserveContext: choice !== "Approve and execute",
 					compactBeforeExecute: choice === "Approve and compact context",
 					executionModel,
-					reviewOwner: pending,
+					reviewOwner,
+					reviewOverlayOwner: pending,
 				});
 				if (executionDispatched) this.#planReviewAnnotationState.delete(annotationStateKey);
 			} catch (error) {
-				this.showError(
-					`Failed to finalize approved plan: ${error instanceof Error ? error.message : String(error)}`,
-				);
+				if (!reviewOwner.invalidated) {
+					this.showError(
+						`Failed to finalize approved plan: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
+			} finally {
+				this.#activePlanReviewContinuations.delete(reviewOwner);
+				closePlanReview();
 			}
-			closePlanReview();
 			return;
 		}
 
 		if (choice === "Refine plan") {
 			const refinement = remote?.choice === "refine" ? (remote.feedback ?? "") : feedback;
 			try {
-				if (refinement.trim()) {
+				if (refinement.trim() && !reviewOwner.invalidated) {
 					if (this.onInputCallback) {
 						const input = this.startPendingSubmission({ text: refinement });
 						this.#planReviewAnnotationStateBySubmission.set(input, annotationStateKey);
 						this.onInputCallback(input);
 					} else {
 						await this.session.prompt(refinement);
-						this.#planReviewAnnotationState.delete(annotationStateKey);
+						if (!reviewOwner.invalidated) this.#planReviewAnnotationState.delete(annotationStateKey);
 					}
-				} else {
+				} else if (!reviewOwner.invalidated) {
 					this.showStatus("Refine plan: enter a follow-up prompt.");
 				}
 			} catch (error) {
-				this.showError(`Failed to refine plan: ${error instanceof Error ? error.message : String(error)}`);
+				if (!reviewOwner.invalidated) {
+					this.showError(`Failed to refine plan: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			} finally {
+				this.#activePlanReviewContinuations.delete(reviewOwner);
+				closePlanReview();
 			}
-			closePlanReview();
 			return;
 		}
+		this.#activePlanReviewContinuations.delete(reviewOwner);
 		closePlanReview();
 	}
-
 	/**
 	 * Pool of consent-prompt variants. Each entry is `[headline, reassurance]`;
 	 * the second line always promises the same scope (tool name + confusion
@@ -7187,13 +7326,15 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	stop(): void {
-		this.#hidePlanReview();
+		this.#invalidatePlanReviews();
 		this.#appearanceRefreshRequest = undefined;
 		// Settle any pending approval prompt as dismissed (deny). The
 		// controller stays aborted: approvals still queued behind the approval
 		// mutex deny on arrival instead of prompting a torn-down UI. `init`
 		// installs a fresh one.
 		this.#dialogLifetime.abort();
+		this.#extensionUiController.disposeSessionDialogs();
+		this.remoteDialogHosts.advanceGeneration(this.sessionManager.getSessionId());
 		this.#streamPublisher?.dispose();
 		this.#streamPublisher = undefined;
 		void this.#recorder?.stop();
@@ -7278,6 +7419,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 			return;
 		}
+		this.remoteDialogHosts.dispose();
 		this.#beginClose();
 		const worktreePlan = await this.#planOwnedWorktreeExit();
 		try {
@@ -8156,7 +8298,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		return true;
 	}
 
-	async prepareSessionSwitch(): Promise<void> {
+	async prepareSessionSwitch(preserveReview?: { invalidated: boolean }): Promise<void> {
+		this.#invalidatePlanReviews(preserveReview);
 		this.#clearJudgmentBatchProgress(true);
 		await this.#btwController.dispose();
 		this.#omfgController.dispose();
@@ -8166,9 +8309,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#hidePlanReview();
 	}
 
-	async handleClearCommand(): Promise<void> {
+	async handleClearCommand(preserveReview?: { invalidated: boolean }): Promise<void> {
 		if (this.#vibeSessionTransitionBlocked()) return;
-		await this.prepareSessionSwitch();
+		await this.prepareSessionSwitch(preserveReview);
 		await this.#commandController.handleClearCommand();
 	}
 

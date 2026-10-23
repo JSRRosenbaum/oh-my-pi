@@ -696,6 +696,43 @@ describe("Agent", () => {
 		expect(JSON.stringify(replayedMessages)).not.toContain("I can't assist");
 	});
 
+	for (const terminalOutcome of ["error", "aborted"] as const) {
+		it(`publishes agent_end when the ${terminalOutcome} turn-end observer also rejects`, async () => {
+			const mock = createMockModel({ responses: [{ content: ["first"] }, { content: ["successor"] }] });
+			const agent = new Agent({
+				initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: mock.stream,
+			});
+			const events: AgentEvent[] = [];
+			const outcomes: string[] = [];
+			agent.subscribe(event => events.push(event));
+			agent.setOnTurnEnd((_messages, _signal, context) => {
+				outcomes.push(context!.outcome);
+				if (terminalOutcome === "aborted") agent.abort();
+				throw new Error("turn-end observer rejected");
+			});
+
+			await agent.prompt("first request");
+
+			expect(outcomes).toEqual(["completed", terminalOutcome]);
+			const terminalEvents = events.filter(event => event.type === "agent_end");
+			expect(terminalEvents).toHaveLength(1);
+			const terminalMessage = terminalEvents[0]!.messages.at(-1);
+			expect(terminalMessage).toMatchObject({ role: "assistant", stopReason: terminalOutcome });
+			if (terminalOutcome === "error") {
+				expect(terminalMessage).toMatchObject({ errorMessage: "turn-end observer rejected" });
+			}
+			expect(agent.state.isStreaming).toBe(false);
+			agent.setOnTurnEnd(undefined);
+			await agent.prompt("successor request");
+			expect(events.filter(event => event.type === "agent_end")).toHaveLength(2);
+			expect(agent.state.messages.at(-1)).toMatchObject({
+				role: "assistant",
+				content: [{ type: "text", text: "successor" }],
+			});
+		});
+	}
+
 	it("prompt() emits assistant error lifecycle for Anthropic output-blocked stream errors before assistant start", async () => {
 		const mock = createMockModel({ responses: [] });
 		const errorText = "Output blocked by content filtering policy";

@@ -42,7 +42,10 @@ import {
 
 const runtimeSignalStoreKey = "__ompRuntimeSignals";
 
-type RuntimeSignalGlobal = typeof globalThis & { [runtimeSignalStoreKey]?: string[] };
+type RuntimeSignalGlobal = typeof globalThis & {
+	[runtimeSignalStoreKey]?: string[];
+	__ompCompactFailed?: () => void;
+};
 
 function getRuntimeSignals(): string[] {
 	const globalWithSignals = globalThis as RuntimeSignalGlobal;
@@ -116,6 +119,12 @@ describe("AgentSession auto-compaction queue resume", () => {
 				});
 				pi.on("auto_compaction_end", event => {
 					getRuntimeSignals().push(`compaction:end:${event.aborted ? "aborted" : "ok"}`);
+				});
+				pi.on("session_compact_failed", event => {
+					getRuntimeSignals().push(
+						`compact:failed:${event.reason}:${event.aborted}:${event.willRetry}:${event.fromExtension}`,
+					);
+					(globalThis as RuntimeSignalGlobal).__ompCompactFailed?.();
 				});
 				pi.on("todo_reminder", event => {
 					getRuntimeSignals().push(`todo:${event.attempt}/${event.maxAttempts}`);
@@ -196,6 +205,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 				await Bun.sleep(0);
 			} finally {
 				getRuntimeSignals().length = 0;
+				(globalThis as RuntimeSignalGlobal).__ompCompactFailed = undefined;
 				(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
 					undefined;
 				(globalThis as typeof globalThis & { __ompAgentStartGate?: AgentStartGate }).__ompAgentStartGate =
@@ -293,7 +303,84 @@ describe("AgentSession auto-compaction queue resume", () => {
 		const runtimeSignals = getRuntimeSignals();
 		expect(runtimeSignals).toContain("compaction:start:threshold");
 		expect(runtimeSignals.some(signal => signal.startsWith("compaction:end:"))).toBe(true);
+		expect(runtimeSignals.filter(signal => signal.startsWith("compact:failed:"))).toHaveLength(0);
 		expect(agentEndTerminalStates).toEqual([false]);
+	});
+
+	it("emits one truthful Pi failure when an automatic threshold compaction is vetoed", async () => {
+		(globalThis as typeof globalThis & { __ompManualCompactCancel?: boolean }).__ompManualCompactCancel = true;
+		const { promise: failed, resolve: onFailed } = Promise.withResolvers<void>();
+		(globalThis as RuntimeSignalGlobal).__ompCompactFailed = () => onFailed();
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe((event: AgentSessionEvent) => {
+			if (event.type === "auto_compaction_end") onCompactionDone();
+		});
+
+		const assistantMsg = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "Done." }],
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+			stopReason: "stop" as const,
+			usage: {
+				input: 190000,
+				output: 1000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 191000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+		await failed;
+		await compactionDone;
+		await session.waitForIdle();
+
+		const signals = getRuntimeSignals();
+		expect(signals.filter(signal => signal.startsWith("compact:failed:"))).toEqual([
+			"compact:failed:threshold:true:false:false",
+		]);
+		expect(signals.filter(signal => signal === "compaction:start:threshold")).toHaveLength(1);
+		expect(signals.filter(signal => signal === "compaction:end:aborted")).toHaveLength(1);
+		expect(session.isCompacting).toBe(false);
+	});
+
+	it("releases Pi compaction state when post-append context rebuilding fails without replaying the rewrite", async () => {
+		const { promise: failed, resolve: onFailed } = Promise.withResolvers<void>();
+		(globalThis as RuntimeSignalGlobal).__ompCompactFailed = () => onFailed();
+		vi.spyOn(session.agent, "replaceMessages").mockImplementationOnce(() => {
+			throw new Error("Controlled post-append context rebuild failure");
+		});
+		const assistantMsg = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "Done." }],
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+			stopReason: "stop" as const,
+			usage: {
+				input: 190000,
+				output: 1000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 191000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+		await failed;
+		await session.waitForIdle();
+		expect(getRuntimeSignals().filter(signal => signal.startsWith("compact:failed:"))).toEqual([
+			"compact:failed:threshold:false:false:true",
+		]);
+		expect(sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(1);
+		expect(session.isCompacting).toBe(false);
 	});
 
 	it("marks manual compaction active before abort teardown can yield", async () => {

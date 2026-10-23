@@ -1,7 +1,7 @@
 /**
  * Issue #2600: Ctrl+C shutdown waits 30s on extension session_shutdown timeout.
  *
- * `ExtensionRunner.emit({ type: "session_shutdown" })` uses the generic
+ * `ExtensionRunner.emit({ type: "session_shutdown", reason: "quit" })` uses the generic
  * 30s extension handler timeout, so a single hung handler (in the wild:
  * `omp-discord-presence` waiting on a Discord IPC pipe that never replied)
  * holds Ctrl+C teardown hostage for the full window. `session_shutdown` is
@@ -103,7 +103,7 @@ describe("issue #2600 - session_shutdown handler timeout", () => {
 			testSetSessionShutdownHandlerTimeoutMs(100);
 
 			const startedAt = performance.now();
-			await runner.emit({ type: "session_shutdown" });
+			await runner.emit({ type: "session_shutdown", reason: "quit" });
 			const elapsedMs = performance.now() - startedAt;
 
 			// Multiple hung shutdown handlers must share the cap. Sequential
@@ -139,7 +139,7 @@ describe("issue #2600 - session_shutdown handler timeout", () => {
 			testSetSessionShutdownHandlerTimeoutMs(50);
 
 			const startedAt = performance.now();
-			await runner.emit({ type: "session_shutdown" });
+			await runner.emit({ type: "session_shutdown", reason: "quit" });
 			const elapsedMs = performance.now() - startedAt;
 
 			expect(elapsedMs).toBeLessThan(500);

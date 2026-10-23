@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserved terminal `agent_end` publication when an awaited turn-end callback also rejects during error or cancellation, keeping subsequent requests usable.
+
 ## [18.12.4] - 2026-10-20
 
 ### Fixed

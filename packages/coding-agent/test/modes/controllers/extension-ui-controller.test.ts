@@ -11,6 +11,8 @@ import { ExtensionUiController } from "../../../src/modes/controllers/extension-
 import { InputController } from "../../../src/modes/controllers/input-controller";
 import { getEditorTheme, getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "../../../src/modes/types";
+import { RemoteDialogHosts } from "../../../src/modes/remote-dialogs";
+import type { RemoteDialogRequest } from "../../../src/modes/remote-dialogs";
 
 afterEach(() => {
 	setKeybindings(KeybindingsManager.inMemory());
@@ -47,6 +49,7 @@ function makeHarness() {
 	const agent = new Agent();
 	const steeringChips = () =>
 		agent.peekSteeringQueue().map(message => (message.role === "user" ? String(message.content) : ""));
+	const remoteDialogHosts = new RemoteDialogHosts("test-session");
 	const ctx = {
 		editor,
 		ui: {
@@ -73,6 +76,7 @@ function makeHarness() {
 		addAutocompleteProvider,
 		syncComposerShape: vi.fn(),
 		showStatus: vi.fn(),
+		remoteDialogHosts,
 	} as unknown as InteractiveModeContext;
 
 	const controller = new ExtensionUiController(ctx);
@@ -87,6 +91,7 @@ function makeHarness() {
 		showOverlay,
 		fakeHandle,
 		controller,
+		remoteDialogHosts,
 		inputController: (readText: () => Promise<string>) =>
 			new InputController(ctx, { readImage: async () => null, readText }),
 		agent,
@@ -113,6 +118,67 @@ function makeHarness() {
 		},
 	};
 }
+describe("ExtensionUiController remote host facade", () => {
+	it("registers a host through ctx.ui and returns an idempotent disposer", async () => {
+		const harness = makeHarness();
+		const ui = await harness.init();
+		const host = { request: vi.fn(() => null) };
+		const dispose = ui.registerRemoteDialogHost!(host);
+		expect(harness.remoteDialogHosts.list()).toHaveLength(1);
+		dispose();
+		dispose();
+		expect(harness.remoteDialogHosts.list()).toHaveLength(0);
+	});
+});
+
+describe("ExtensionUiController remote ask host", () => {
+	it("routes public ask dialogs as extension-user and preserves structured answers", async () => {
+		const harness = makeHarness();
+		const host = {
+			request: vi.fn((request: RemoteDialogRequest) => {
+				if (request.kind !== "ask") return null;
+				return Promise.resolve({
+					kind: "answered" as const,
+					value: {
+						kind: "submit" as const,
+						results: [
+							{
+								id: "choice",
+								question: "Continue?",
+								options: ["Yes"],
+								multi: false,
+								selectedOptions: ["Yes"],
+							},
+						],
+					},
+				});
+			}),
+		};
+		harness.remoteDialogHosts.register(host);
+		const result = await harness.controller.showAskDialog([
+			{ id: "choice", question: "Continue?", options: [{ label: "Yes" }] },
+		]);
+		expect(host.request.mock.calls[0]?.[0].provenance.promptClass).toBe("extension-user");
+		expect(result).toMatchObject({ kind: "submit", results: [{ selectedOptions: ["Yes"] }] });
+	});
+});
+describe("ExtensionUiController input and editor remote routing", () => {
+	it("offers input and editor requests to a registered host", async () => {
+		const harness = makeHarness();
+		const host = {
+			request: vi.fn((request: RemoteDialogRequest) => {
+				if (request.kind === "input" || request.kind === "editor") {
+					return Promise.resolve({ kind: "answered" as const, value: "remote value" });
+				}
+				return null;
+			}),
+		};
+		harness.remoteDialogHosts.register(host);
+		await expect(harness.controller.showRemoteAwareInput("Name?")).resolves.toBe("remote value");
+		await expect(harness.controller.showRemoteAwareEditor("Details?")).resolves.toBe("remote value");
+		expect(host.request.mock.calls.map(([request]) => request.kind)).toEqual(["input", "editor"]);
+	});
+});
 
 describe("ExtensionUiController Ask dialog input", () => {
 	const questions: ExtensionAskDialogQuestion[] = [
@@ -533,6 +599,19 @@ describe("ExtensionUiController tool approval", () => {
 		full: "Allow tool: bash\nCommand: rm -rf build",
 		compact: "Allow tool: bash\nCommand: rm -rf build",
 	};
+	it("never forwards privileged tool approval prompts to a registered user-dialog host", async () => {
+		const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
+		const harness = makeHarness();
+		const request = vi.fn(() => null);
+		harness.remoteDialogHosts.register({ request });
+		const pending = harness.controller.showCollabAwareApproval(prompt);
+		expect(request).not.toHaveBeenCalled();
+		now.mockReturnValue(2_000);
+		harness.handleInput("\r");
+		expect(await pending).toBe("once");
+		expect(request).not.toHaveBeenCalled();
+		now.mockRestore();
+	});
 
 	it("lists the choices over a live composer: with it empty, the arrows and Enter take the session approval", async () => {
 		const now = vi.spyOn(performance, "now").mockReturnValue(1_000);

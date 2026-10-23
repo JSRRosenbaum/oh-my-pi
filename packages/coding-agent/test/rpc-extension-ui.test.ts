@@ -1,3 +1,6 @@
+import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
+import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { RemoteDialogHosts } from "@oh-my-pi/pi-coding-agent/modes/remote-dialogs";
 import { describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { isRecord, readJsonl, TempDir } from "@oh-my-pi/pi-utils";
@@ -88,6 +91,50 @@ export default function (pi) {
 	});
 }
 `;
+
+describe("extension UI session dialog lifetime", () => {
+	it("aborts outgoing remote requests and accepts successor registrations after replacement", async () => {
+		const remoteDialogHosts = new RemoteDialogHosts("outgoing");
+		const remoteSignals: AbortSignal[] = [];
+		remoteDialogHosts.register({
+			request: (_request, signal) => {
+				remoteSignals.push(signal);
+				return new Promise(() => {});
+			},
+		});
+		const controller = new ExtensionUiController({ remoteDialogHosts } as InteractiveModeContext);
+		const localSignals: AbortSignal[] = [];
+		vi.spyOn(controller, "showHookEditor").mockImplementation((_title, _prefill, options) => {
+			const result = Promise.withResolvers<string | undefined>();
+			const signal = options?.signal;
+			if (signal) {
+				localSignals.push(signal);
+				signal.addEventListener("abort", () => result.resolve(undefined), { once: true });
+			}
+			return result.promise;
+		});
+		const outgoing = controller.showRemoteAwareEditor("outgoing");
+		expect(remoteSignals).toHaveLength(1);
+
+		controller.advanceSessionDialogs();
+		remoteDialogHosts.abortCurrentGeneration();
+		remoteDialogHosts.advanceGeneration("successor");
+
+		expect(remoteSignals[0]?.aborted).toBe(true);
+		expect(localSignals[0]?.aborted).toBe(true);
+		expect(await outgoing).toBeUndefined();
+		remoteDialogHosts.register({ request: (_request, signal) => (remoteSignals.push(signal), null) });
+		const successor = controller.showRemoteAwareEditor("successor");
+		expect(remoteSignals).toHaveLength(2);
+		expect(localSignals[1]?.aborted).toBe(false);
+
+		controller.disposeSessionDialogs();
+		remoteDialogHosts.dispose();
+
+		expect(localSignals[1]?.aborted).toBe(true);
+		expect(await successor).toBeUndefined();
+	});
+});
 
 describe("RPC extension UI", () => {
 	it("keeps extension dialogs headless while tool selections round-trip", async () => {

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Codex requiring fabricated optional tool arguments, which prevented text-only Telegram messages and other extension calls from completing.
+
 ## [18.12.5] - 2026-10-21
 
 ### Added

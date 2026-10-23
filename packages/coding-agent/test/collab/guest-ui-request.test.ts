@@ -31,6 +31,7 @@ import type {
 	ExtensionUISelectItem,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
+import { RemoteDialogHosts } from "@oh-my-pi/pi-coding-agent/modes/remote-dialogs";
 import type { InteractiveModeContext, InteractiveSelectorDialogOptions } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
@@ -483,6 +484,7 @@ function makeHostContext(): InteractiveModeContext {
 		},
 		ui: { requestRender: () => {} },
 		showStatus: () => {},
+		remoteDialogHosts: new RemoteDialogHosts("sess-proto"),
 		collabHost: undefined,
 	} as unknown as InteractiveModeContext;
 }

@@ -272,7 +272,7 @@ describe("collab guest extension lifecycle mirror", () => {
 				harness.hostSocket.send({ t: "event", event: { type: "turn_start" } } as CollabFrame);
 				harness.hostSocket.send({
 					t: "event",
-					event: { type: "turn_end", message: assistantMessage, toolResults: [] },
+					event: { type: "turn_end", message: assistantMessage, toolResults: [], outcome: "completed" },
 				} as CollabFrame);
 			};
 			// Two host prompts, two turns each: a local session numbers both

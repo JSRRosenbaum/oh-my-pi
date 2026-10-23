@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent, AppendOnlyContextManager } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
@@ -31,6 +31,7 @@ async function teardown(): Promise<void> {
 }
 
 async function createHarness(options?: {
+	persist?: boolean;
 	extension?: {
 		name: string;
 		register: (api: ExtensionAPI) => void;
@@ -38,7 +39,10 @@ async function createHarness(options?: {
 }): Promise<{ agent: Agent; session: AgentSession; sessionManager: SessionManager }> {
 	const tempDir = TempDir.createSync("@pi-new-session-boundary-");
 	const cwd = tempDir.path();
-	const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+	const sessionManager =
+		options?.persist === false
+			? SessionManager.inMemory(cwd)
+			: SessionManager.create(cwd, path.join(cwd, "sessions"));
 	const agent = new Agent({
 		initialState: {
 			systemPrompt: ["Test"],
@@ -109,7 +113,263 @@ describe("AgentSession.newSession boundary", () => {
 		expect(session.sessionId).not.toBe(previousSessionId);
 		expect(session.sessionId).toBe(sessionManager.getSessionId());
 	});
+	it("shuts down the departing extension identity before notifying and starting /new", async () => {
+		const events: string[] = [];
+		let outgoingBranchWasSource = false;
+		const { session, sessionManager } = await createHarness({
+			extension: {
+				name: "session-replacement-events",
+				register: pi => {
+					pi.on("session_shutdown", (event, ctx) => {
+						events.push(`${event.type}:${event.reason}:${ctx.sessionManager.getSessionId()}`);
+						outgoingBranchWasSource = ctx.sessionManager
+							.getBranch()
+							.some(
+								entry =>
+									entry.type === "message" &&
+									entry.message.role === "user" &&
+									entry.message.content === "source",
+							);
+						writeOutgoingState();
+					});
+					pi.on("session_switch", (event, ctx) => {
+						events.push(`${event.type}:${event.reason}:${ctx.sessionManager.getSessionId()}`);
+					});
+					pi.on("session_start", (event, ctx) => {
+						events.push(`${event.type}:${event.reason}:${ctx.sessionManager.getSessionId()}`);
+					});
+				},
+			},
+		});
+		const previousId = sessionManager.getSessionId();
+		sessionManager.appendMessage({ role: "user", content: "source", timestamp: 1 });
+		await sessionManager.ensureOnDisk();
+		const previousFile = sessionManager.getSessionFile();
+		if (!previousFile) throw new Error("Expected an outgoing persisted session");
+		const writeOutgoingState = () => {
+			sessionManager.appendCustomEntry("outgoing-state", { saved: true });
+		};
 
+		expect(await session.newSession()).toBe(true);
+
+		const successorId = sessionManager.getSessionId();
+		expect(successorId).not.toBe(previousId);
+		expect(events).toEqual([
+			`session_shutdown:new:${previousId}`,
+			`session_switch:new:${successorId}`,
+			`session_start:new:${successorId}`,
+		]);
+		expect(outgoingBranchWasSource).toBe(true);
+		const outgoing = Bun.JSONL.parse(await Bun.file(previousFile).text()) as { type: string; customType?: string }[];
+		expect(outgoing.filter(entry => entry.customType === "outgoing-state")).toHaveLength(1);
+		expect(
+			sessionManager.getEntries().some(entry => entry.type === "custom" && entry.customType === "outgoing-state"),
+		).toBe(false);
+	});
+
+	it("emits no replacement lifecycle when /new is cancelled", async () => {
+		const lifecycleEvents: string[] = [];
+		const { session } = await createHarness({
+			extension: {
+				name: "cancelled-session-replacement",
+				register: pi => {
+					pi.on("session_before_switch", () => ({ cancel: true }));
+					pi.on("session_shutdown", event => {
+						lifecycleEvents.push(`${event.type}:${event.reason}`);
+					});
+					pi.on("session_start", event => {
+						lifecycleEvents.push(`${event.type}:${event.reason}`);
+					});
+					pi.on("session_switch", event => {
+						lifecycleEvents.push(`${event.type}:${event.reason}`);
+					});
+				},
+			},
+		});
+
+		expect(await session.newSession()).toBe(false);
+		expect(lifecycleEvents).toEqual([]);
+	});
+
+	it("runs the fork lifecycle against the departing session identity", async () => {
+		const events: string[] = [];
+		const { session, sessionManager } = await createHarness({
+			extension: {
+				name: "session-fork-events",
+				register: pi => {
+					pi.on("session_shutdown", (event, ctx) => {
+						events.push(`${event.type}:${event.reason}:${ctx.sessionManager.getSessionId()}`);
+					});
+					pi.on("session_switch", (event, ctx) => {
+						events.push(`${event.type}:${event.reason}:${ctx.sessionManager.getSessionId()}`);
+					});
+					pi.on("session_start", (event, ctx) => {
+						events.push(`${event.type}:${event.reason}:${ctx.sessionManager.getSessionId()}`);
+					});
+				},
+			},
+		});
+		const previousId = sessionManager.getSessionId();
+
+		expect(await session.fork()).toBe(true);
+
+		const successorId = sessionManager.getSessionId();
+		expect(successorId).not.toBe(previousId);
+		expect(events).toEqual([
+			`session_shutdown:fork:${previousId}`,
+			`session_switch:fork:${successorId}`,
+			`session_start:fork:${successorId}`,
+		]);
+	});
+	it("keeps an in-memory no-op fork's extension runtime active", async () => {
+		const lifecycleEvents: string[] = [];
+		const { session } = await createHarness({
+			persist: false,
+			extension: {
+				name: "no-op-session-fork",
+				register: pi => {
+					pi.on("session_shutdown", event => {
+						lifecycleEvents.push(`${event.type}:${event.reason}`);
+					});
+					pi.on("session_start", event => {
+						lifecycleEvents.push(`${event.type}:${event.reason}`);
+					});
+					pi.on("session_switch", event => {
+						lifecycleEvents.push(`${event.type}:${event.reason}`);
+					});
+				},
+			},
+		});
+
+		expect(await session.fork()).toBe(false);
+		expect(lifecycleEvents).toEqual([]);
+	});
+
+	for (const operation of ["fork", "branch"] as const) {
+		it(`runs the entry-${operation} replacement lifecycle without replacing the branch API`, async () => {
+			const events: string[] = [];
+			const { session, sessionManager, agent } = await createHarness({
+				extension: {
+					name: "session-entry-fork-events",
+					register: pi => {
+						pi.on("session_shutdown", (event, ctx) => {
+							events.push(`${event.type}:${event.reason}:${ctx.sessionManager.getSessionId()}`);
+						});
+						pi.on("session_branch", (event, ctx) => {
+							events.push(`${event.type}:${event.reason}:${ctx.sessionManager.getSessionId()}`);
+						});
+						pi.on("session_start", (event, ctx) => {
+							events.push(`${event.type}:${event.reason}:${ctx.sessionManager.getSessionId()}`);
+						});
+					},
+				},
+			});
+			sessionManager.appendMessage({ role: "user", content: "fork point", timestamp: 1 });
+			const entryId = sessionManager.getLeafId();
+			if (!entryId) throw new Error("Expected a forkable message");
+			agent.replaceMessages(sessionManager.buildSessionContext().messages);
+			const previousId = sessionManager.getSessionId();
+
+			if (operation === "fork") expect(await session.fork(entryId)).toBe(true);
+			else expect((await session.branch(entryId)).cancelled).toBe(false);
+
+			const successorId = sessionManager.getSessionId();
+			expect(successorId).not.toBe(previousId);
+			expect(events).toEqual([
+				`session_shutdown:fork:${previousId}`,
+				`session_branch:${operation}:${successorId}`,
+				`session_start:fork:${successorId}`,
+			]);
+		});
+	}
+	it("starts a /btw successor after its branch event with the successor identity", async () => {
+		const events: string[] = [];
+		const { session, sessionManager, agent } = await createHarness({
+			extension: {
+				name: "session-entry-btw-events",
+				register: pi => {
+					pi.on("session_shutdown", (event, ctx) => {
+						events.push(`${event.type}:${event.reason}:${ctx.sessionManager.getSessionId()}`);
+					});
+					pi.on("session_branch", (event, ctx) => {
+						events.push(`${event.type}:${event.reason}:${ctx.sessionManager.getSessionId()}`);
+					});
+					pi.on("session_start", (event, ctx) => {
+						events.push(`${event.type}:${event.reason}:${ctx.sessionManager.getSessionId()}`);
+					});
+				},
+			},
+		});
+		sessionManager.appendMessage({ role: "user", content: "fork point", timestamp: 1 });
+		const leafId = sessionManager.getLeafId();
+		if (!leafId) throw new Error("Expected a /btw branch point");
+		agent.replaceMessages(sessionManager.buildSessionContext().messages);
+		const previousId = sessionManager.getSessionId();
+
+		const result = await session.branchFromBtw("side question", assistantMsg("side answer"), leafId, previousId);
+
+		expect(result.cancelled).toBe(false);
+		const successorId = sessionManager.getSessionId();
+		expect(successorId).not.toBe(previousId);
+		expect(events).toEqual([
+			`session_shutdown:fork:${previousId}`,
+			`session_branch:btw:${successorId}`,
+			`session_start:fork:${successorId}`,
+		]);
+	});
+	for (const transition of ["new", "btw"] as const) {
+		it(`clears outgoing managed timers before ${transition} startup without losing successor timers`, async () => {
+			const counts = { outgoingInterval: 0, outgoingTimeout: 0, successorInterval: 0, successorTimeout: 0 };
+			let generation = 0;
+			const { session, sessionManager, agent } = await createHarness({
+				extension: {
+					name: `managed-timers-${transition}`,
+					register: pi => {
+						pi.on("session_start", (event, ctx) => {
+							generation++;
+							const outgoing = generation === 1;
+							ctx.setInterval(() => counts[outgoing ? "outgoingInterval" : "successorInterval"]++, 2);
+							ctx.setTimeout(() => counts[outgoing ? "outgoingTimeout" : "successorTimeout"]++, 25);
+						});
+					},
+				},
+			});
+			if (transition === "btw") {
+				sessionManager.appendMessage({ role: "user", content: "fork point", timestamp: 1 });
+				const leafId = sessionManager.getLeafId();
+				if (!leafId) throw new Error("Expected a /btw branch point");
+				agent.replaceMessages(sessionManager.buildSessionContext().messages);
+			}
+
+			vi.useFakeTimers();
+			try {
+				await session.extensionRunner?.emit({ type: "session_start", reason: "startup" });
+				vi.advanceTimersByTime(5);
+				const outgoingIntervalAtBoundary = counts.outgoingInterval;
+				const outgoingTimeoutAtBoundary = counts.outgoingTimeout;
+				if (transition === "new") {
+					expect(await session.newSession()).toBe(true);
+				} else {
+					const leafId = sessionManager.getLeafId();
+					if (!leafId) throw new Error("Expected a /btw branch point");
+					const previousSessionId = sessionManager.getSessionId();
+					expect(
+						(await session.branchFromBtw("side question", assistantMsg("side answer"), leafId, previousSessionId))
+							.cancelled,
+					).toBe(false);
+				}
+				vi.advanceTimersByTime(30);
+
+				expect(counts.outgoingInterval).toBe(outgoingIntervalAtBoundary);
+				expect(counts.outgoingTimeout).toBe(outgoingTimeoutAtBoundary);
+				expect(outgoingIntervalAtBoundary).toBeGreaterThan(0);
+				expect(counts.successorInterval).toBeGreaterThan(0);
+				expect(counts.successorTimeout).toBe(1);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+	}
 	it("keeps old-session messages out of the new session when notifications finish late", async () => {
 		const reached = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
@@ -247,8 +507,61 @@ describe("AgentSession.newSession boundary", () => {
 		});
 	}
 
-	it("waits through full switch rollback before exposing the restored session", async () => {
-		const { session, sessionManager, agent } = await createHarness();
+	it("publishes resume lifecycle only after a successful different-session switch", async () => {
+		const events: string[] = [];
+		const { session, sessionManager } = await createHarness({
+			extension: {
+				name: "session-resume-events",
+				register: pi => {
+					pi.on("session_shutdown", (event, ctx) => {
+						events.push(`${event.type}:${event.reason}:${ctx.sessionManager.getSessionId()}`);
+					});
+					pi.on("session_switch", (event, ctx) => {
+						events.push(`${event.type}:${event.reason}:${ctx.sessionManager.getSessionId()}`);
+					});
+					pi.on("session_start", (event, ctx) => {
+						events.push(`${event.type}:${event.reason}:${ctx.sessionManager.getSessionId()}`);
+					});
+				},
+			},
+		});
+		const target = await createHarness();
+		const previousId = sessionManager.getSessionId();
+		target.sessionManager.appendMessage({ role: "user", content: "resumed context", timestamp: 1 });
+		await target.sessionManager.ensureOnDisk();
+		await target.sessionManager.flush();
+		const targetFile = target.sessionManager.getSessionFile();
+		if (!targetFile) throw new Error("Expected persisted target session");
+
+		expect(await session.switchSession(targetFile, { onCwdChange: async () => true })).toBe(true);
+
+		const successorId = sessionManager.getSessionId();
+		expect(successorId).not.toBe(previousId);
+		expect(events).toEqual([
+			`session_shutdown:resume:${previousId}`,
+			`session_switch:resume:${successorId}`,
+			`session_start:resume:${successorId}`,
+		]);
+	});
+
+	it("waits through full switch rollback and restarts the stopped outgoing extension runtime", async () => {
+		const lifecycleEvents: string[] = [];
+		const { session, sessionManager, agent } = await createHarness({
+			extension: {
+				name: "failed-switch-has-no-lifecycle-replacement",
+				register: pi => {
+					pi.on("session_shutdown", event => {
+						lifecycleEvents.push(`${event.type}:${event.reason}`);
+					});
+					pi.on("session_start", event => {
+						lifecycleEvents.push(`${event.type}:${event.reason}`);
+					});
+					pi.on("session_switch", event => {
+						lifecycleEvents.push(`${event.type}:${event.reason}`);
+					});
+				},
+			},
+		});
 		const target = await createHarness();
 		sessionManager.appendMessage({ role: "user", content: "source", timestamp: 1 });
 		agent.replaceMessages(sessionManager.buildSessionContext().messages);
@@ -295,6 +608,7 @@ describe("AgentSession.newSession boundary", () => {
 			await waiting;
 			expect(session.isSessionTransitioning).toBe(false);
 			expect(session.messages).toEqual([{ role: "user", content: "source", timestamp: 1 }]);
+			expect(lifecycleEvents).toEqual(["session_shutdown:resume", "session_start:reload"]);
 		} finally {
 			failAdoption.resolve();
 			rollbackRelease.resolve();

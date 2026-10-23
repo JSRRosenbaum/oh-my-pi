@@ -3598,12 +3598,21 @@
 					"items": {
 						"$ref": "#/$defs/ToolResultMessage"
 					}
+				},
+				"outcome": {
+					"enum": [
+						"completed",
+						"aborted",
+						"error"
+					],
+					"type": "string"
 				}
 			},
 			"required": [
 				"type",
 				"message",
-				"toolResults"
+				"toolResults",
+				"outcome"
 			]
 		},
 		"MessageStartEvent": {

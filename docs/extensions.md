@@ -486,6 +486,11 @@ Cancelable pre-events:
 
 `session_before_branch` and `session_branch` carry `reason`, which decides what `session_before_branch.entryId` means. For `"branch"` (`branch(entryId)`, `/branch`) it is the user message being rewound: it and everything after it are dropped. For `"fork"` (`AgentSession.fork(entryId)`, RPC `fork` with an `entryId`) and `"btw"` (`/btw` promotion) it is the last entry kept in the new session.
 
+Replacement sessions emit `session_shutdown` before the transition and
+`session_start` after the successor identity is active. A `session_tree` event
+expires remote-dialog registration without a following `session_start`; hosts
+handling that event must re-register separately.
+
 ### Prompt and turn lifecycle
 
 - `input`

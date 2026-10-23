@@ -77,6 +77,76 @@ function makeEchoTool(executions: string[]) {
 const harmonyMitigationModel = createHarmonyMitigationModel();
 
 describe("agentLoop with AgentMessage", () => {
+	it("persists accepted turn contributions before the next provider request", async () => {
+		const context: AgentContext = { systemPrompt: [], messages: [], tools: [] };
+		const mock = createMockModel({ responses: [{ content: ["First"] }, { content: ["Second"] }] });
+		const committed: string[] = [];
+		let turns = 0;
+		let requests = 0;
+		const contribution = createUserMessage("Accepted steering");
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: messages => {
+				requests++;
+				if (requests === 2) {
+					expect(committed).toEqual(["Accepted steering"]);
+					expect(messages).toContain(contribution);
+				}
+				return identityConverter(messages);
+			},
+			onTurnEnd: () =>
+				++turns === 1
+					? {
+							messages: [contribution],
+							continue: true,
+							onMessagesCommitted: async () => {
+								await Promise.resolve();
+								committed.push("Accepted steering");
+							},
+						}
+					: undefined,
+		};
+		const stream = agentLoop([createUserMessage("Start")], context, config, undefined, mock.stream);
+		for await (const _event of stream) {
+			/* Drain the actual loop. */
+		}
+		expect(requests).toBe(2);
+		expect((await stream.result()).filter(message => message === contribution)).toHaveLength(1);
+	});
+
+	it("retains an accepted contribution but does not continue after a hook-time abort", async () => {
+		const controller = new AbortController();
+		const context: AgentContext = { systemPrompt: [], messages: [], tools: [] };
+		const mock = createMockModel({ responses: [{ content: ["First"] }, { content: ["Must not run"] }] });
+		const contribution = createUserMessage("Already accepted");
+		let committed = false;
+		let requests = 0;
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: messages => {
+				requests++;
+				return identityConverter(messages);
+			},
+			onTurnEnd: () => {
+				controller.abort();
+				return {
+					messages: [contribution],
+					continue: true,
+					onMessagesCommitted: () => {
+						committed = true;
+					},
+				};
+			},
+		};
+		const stream = agentLoop([createUserMessage("Start")], context, config, controller.signal, mock.stream);
+		for await (const _event of stream) {
+			/* Drain cancellation. */
+		}
+		expect(committed).toBe(true);
+		expect(requests).toBe(1);
+		expect((await stream.result()).filter(message => message === contribution)).toHaveLength(1);
+	});
+
 	it("should emit events with AgentMessage types", async () => {
 		const context: AgentContext = {
 			systemPrompt: ["You are helpful."],
@@ -601,11 +671,15 @@ describe("agentLoop with AgentMessage", () => {
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
 		const controller = new AbortController();
 		let returnCalled = false;
+		const entered = Promise.withResolvers<void>();
 		const streamFn = () =>
 			({
 				result: () => Promise.withResolvers<AssistantMessage>().promise,
 				[Symbol.asyncIterator]: () => ({
-					next: () => Promise.withResolvers<IteratorResult<AssistantMessageEvent>>().promise,
+					next: () => {
+						entered.resolve();
+						return Promise.withResolvers<IteratorResult<AssistantMessageEvent>>().promise;
+					},
 					return: () => {
 						returnCalled = true;
 						return Promise.withResolvers<IteratorResult<AssistantMessageEvent>>().promise;
@@ -614,7 +688,8 @@ describe("agentLoop with AgentMessage", () => {
 			}) as AssistantMessageEventStream;
 
 		const stream = agentLoop([createUserMessage("Hello")], context, config, controller.signal, streamFn);
-		queueMicrotask(() => controller.abort("stop now"));
+		await entered.promise;
+		controller.abort("stop now");
 		const messages = await stream.result();
 
 		expect(returnCalled).toBe(true);
@@ -6801,7 +6876,7 @@ describe("agentLoop passive additionalContext", () => {
 		release.resolve();
 		await consuming;
 
-		expect(mock.calls).toHaveLength(2);
+		expect(mock.calls).toHaveLength(1);
 		const aborted = events.find(
 			event =>
 				event.type === "message_end" &&
