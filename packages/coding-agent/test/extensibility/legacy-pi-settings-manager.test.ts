@@ -60,6 +60,24 @@ describe("legacy pi SettingsManager shim (issue #10397)", () => {
 		expect(s.getShellCommandPrefix()).toBe("export GLOBAL=1");
 	});
 
+	it("persists enabled-model selection and clearing without changing another manager", async () => {
+		const config = path.join(agentDir, "config.yml");
+		await Bun.write(config, YAML.stringify({ enabledModels: ["provider/old"] }));
+		await Settings.init({ cwd: projectDir, agentDir });
+		const manager = SettingsManager.create(projectDir);
+		const other = SettingsManager.inMemory();
+		other.setEnabledModels(["provider/other"]);
+		expect(manager.getEnabledModels()).toEqual(["provider/old"]);
+		manager.setEnabledModels(["provider/new"]);
+		await manager.flush();
+		expect(YAML.parse(await Bun.file(config).text())).toMatchObject({ enabledModels: ["provider/new"] });
+		manager.setEnabledModels(undefined);
+		await manager.flush();
+		expect(manager.getEnabledModels()).toEqual([]);
+		expect(YAML.parse(await Bun.file(config).text())).not.toHaveProperty("enabledModels");
+		expect(other.getEnabledModels()).toEqual(["provider/other"]);
+	});
+
 	it("returns a deep clone so callers cannot mutate internal state", async () => {
 		await Bun.write(path.join(agentDir, "config.yml"), YAML.stringify({ piVim: { mode: "normal" } }, null, 2));
 		await Settings.init({ cwd: projectDir, agentDir });

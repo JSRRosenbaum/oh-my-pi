@@ -45,6 +45,7 @@ import legacyAvailableSkillsTemplate from "./legacy-pi-available-skills.md" with
 import { getPackageDir as getOmpPackageDir } from "../config";
 import { formatKeyHints } from "@oh-my-pi/pi-tui/app-keybindings";
 import type { PromptTemplate } from "../config/prompt-templates";
+import { cfgEnabledModels } from "../config/model-settings";
 import { findScopedSettings, Settings } from "../config/settings";
 import { cfgLegacyShellCommandPrefix, cfgShellPath } from "../exec/settings";
 import { EditTool } from "../edit";
@@ -796,8 +797,8 @@ export function createReadOnlyTools(cwd: string): ToolDefinition[] {
  * Legacy pi `SettingsManager` shim.
  *
  * Upstream Pi's `SettingsManager.create(cwd)` is **synchronous** and returns a
- * manager exposing `getGlobalSettings()`/`getProjectSettings()`, shell
- * accessors, and the typed `get(path)`. OMP's `Settings` backs that manager;
+ * manager exposing `getGlobalSettings()`/`getProjectSettings()`, shell and
+ * enabled-model accessors. OMP's typed setting handles back those accessors;
  * the shim resolves the active extension session's instance first, then falls
  * back to a live instance matching the requested `cwd`/`agentDir`, or an
  * isolated instance when nothing matches. Returning the promise from
@@ -808,6 +809,8 @@ export function createReadOnlyTools(cwd: string): ToolDefinition[] {
 interface LegacyShellAccessors {
 	getShellPath(): string | undefined;
 	getShellCommandPrefix(): string | undefined;
+	getEnabledModels(): string[];
+	setEnabledModels(patterns: string[] | undefined): void;
 }
 
 function hasLegacyShellAccessors(settings: Settings): settings is Settings & LegacyShellAccessors {
@@ -815,6 +818,10 @@ function hasLegacyShellAccessors(settings: Settings): settings is Settings & Leg
 		"getShellPath" in settings &&
 		typeof settings.getShellPath === "function" &&
 		"getShellCommandPrefix" in settings &&
+		"getEnabledModels" in settings &&
+		typeof settings.getEnabledModels === "function" &&
+		"setEnabledModels" in settings &&
+		typeof settings.setEnabledModels === "function" &&
 		typeof settings.getShellCommandPrefix === "function"
 	);
 }
@@ -828,6 +835,11 @@ function withLegacyShellAccessors(settings: Settings): Settings & LegacyShellAcc
 			return shellPath ? expandTilde(shellPath) : shellPath;
 		},
 		getShellCommandPrefix: () => cfgLegacyShellCommandPrefix.get(settings),
+		getEnabledModels: () => cfgEnabledModels.get(settings),
+		setEnabledModels: (patterns: string[] | undefined) => {
+			if (patterns === undefined) cfgEnabledModels.unset(settings);
+			else cfgEnabledModels.set(settings, patterns);
+		},
 	});
 }
 

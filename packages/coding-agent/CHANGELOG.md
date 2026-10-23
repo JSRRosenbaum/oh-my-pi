@@ -15,6 +15,7 @@
 - Keep accepted turn contributions durable exactly once across cancellation; do not call the provider again after an interrupted tool batch ([#1](https://github.com/JSRRosenbaum/oh-my-pi/pull/1) by [@JSRRosenbaum](https://github.com/JSRRosenbaum)).
 - Notify extension consumers when started compaction fails or is cancelled, including post-append bookkeeping failures, and expose user-dialog wait spans without forwarding privileged consent ([#1](https://github.com/JSRRosenbaum/oh-my-pi/pull/1) by [@JSRRosenbaum](https://github.com/JSRRosenbaum)).
 - Preserve SDK disposal options and emit `session_shutdown.reason: "restart"` for `/restart`, allowing companions to hand off external bindings before a same-PID process replacement without treating it as quit ([#1](https://github.com/JSRRosenbaum/oh-my-pi/pull/1) by [@JSRRosenbaum](https://github.com/JSRRosenbaum)).
+- Preserve the enumerable extension-context surface and scoped legacy enabled-model accessors so Pi menus can read native session state and model settings without losing live getters or handler-scoped UI cancellation ([#1](https://github.com/JSRRosenbaum/oh-my-pi/pull/1) by [@JSRRosenbaum](https://github.com/JSRRosenbaum)).
 
 ## [18.12.6] - 2026-10-21
 

@@ -268,10 +268,11 @@ function createHandlerUIContext(
 }
 
 /**
- * Scope `ctx` to a single handler run without spreading it: `{ ...ctx }` would
- * snapshot live accessors (notably the `model` getter), so a handler calling
- * `pi.setModel()` and then reading `ctx.model` would see a stale model.
- * Prototype delegation keeps every getter live while overriding `ui`.
+ * Scope `ctx` to one handler while preserving live accessors and own properties.
+ * Spreading values would snapshot `model` and bind `annotations` to the unscoped
+ * UI; prototype-only delegation loses fields when Pi consumers spread `ctx`.
+ * Copy descriptors so both the live getters and the public enumerable surface
+ * survive the handler's UI and compaction overrides.
  */
 function createHandlerContext(
 	ctx: ExtensionContext,
@@ -279,7 +280,7 @@ function createHandlerContext(
 	timeoutBudget?: HandlerTimeoutBudget,
 	compactTimeoutBudget?: HandlerTimeoutBudget,
 ): ExtensionContext {
-	const scoped: ExtensionContext = Object.create(ctx);
+	const scoped: ExtensionContext = Object.create(Object.getPrototypeOf(ctx), Object.getOwnPropertyDescriptors(ctx));
 	Object.defineProperties(scoped, {
 		ui: {
 			value: createHandlerUIContext(ctx.ui, handlerSignal, timeoutBudget),
@@ -1594,7 +1595,7 @@ export class ExtensionRunner {
 				: undefined,
 			localProtocolOptions: this.localProtocolOptions,
 			memory: this.#getMemoryFn?.(),
-			// A getter, not a value: `createHandlerContext` scopes a handler via `Object.create(ctx)`, and
+			// A getter, not a value: `createHandlerContext` copies its descriptor, and
 			// `this` here is that receiver, so the overlay mounts through the handler's timeout-aware `ui`.
 			get annotations(): ExtensionAnnotationsAPI {
 				return createAnnotations ? createAnnotations(() => this, sendUserMessage) : UNAVAILABLE_ANNOTATIONS;

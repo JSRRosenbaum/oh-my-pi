@@ -286,6 +286,10 @@ Also exposed:
 - `pi.typebox` (legacy TypeBox-compatible shim)
 - `pi.pi` (package exports)
 
+Legacy Pi `SettingsManager.create(cwd)` remains synchronous and resolves the active extension session's settings, not another session's singleton. Its `getEnabledModels()` and `setEnabledModels(patterns)` accessors use the native typed `enabledModels` handle; passing `undefined` removes the global selection, and `flush()` persists the change. The removed generic string-path settings API is not restored.
+
+Handler contexts preserve own enumerable fields such as `sessionManager` while retaining live `model` and `annotations` getters. Pi consumers may clone the context for a status view without losing session access; an explicit value spread still snapshots getters at the consumer's chosen point. Handler-scoped UI cancellation remains in effect.
+
 ### Runtime setting overrides
 
 Settings are addressed through typed registry handles (see "Definitions" in [config-usage.md](./config-usage.md#definitions-srcconfigregistryts)); the string-path `settings.get`/`set`/`override` methods were removed in 18.3. Extensions resolve a handle by id with `lookup(id)` (and enumerate them with `all()`) from the `@oh-my-pi/pi-coding-agent/config/registry` subpath, then pass `pi.pi.settings` as the scope:
