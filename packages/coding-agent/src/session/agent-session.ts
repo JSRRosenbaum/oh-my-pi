@@ -335,6 +335,12 @@ import {
 	type AsyncResultEntry,
 	buildAsyncResultBatchMessage,
 } from "./async-job-delivery";
+import {
+	consumeRestartSessionStopCheck,
+	createRestartSessionStopCheck,
+	isDisplayOnlyCustomMessage,
+	isRestartSessionStopCheckCurrent,
+} from "./restart-session-stop-check";
 import { BashRunner, type BashRunnerHost } from "./bash-runner";
 import {
 	checkpointStartedAtFromEntry,
@@ -456,7 +462,8 @@ import {
 	type SessionDumpLiveState,
 } from "./session-dump-format";
 import { collectSubSessions, type SubSession } from "./sub-sessions";
-import type { BranchSummaryEntry, NewSessionOptions } from "./session-entries";
+import type { BranchSummaryEntry, NewSessionOptions, SessionMessageEntry } from "./session-entries";
+import type { RestartSessionStopCheckIntent } from "./restart-session-stop-check";
 import { SessionHandoff, type SessionHandoffHost } from "./session-handoff";
 import {
 	COMPACTION_CHECK_NONE,
@@ -1148,6 +1155,9 @@ export class AgentSession implements SettingsScope {
 	#postPromptTasks = new Set<Promise<unknown>>();
 	#postPromptTasksPromise: Promise<void> | undefined = undefined;
 	#postPromptTasksResolve: (() => void) | undefined = undefined;
+	#restartSessionStopCheckAbortController: AbortController | undefined;
+	#restartSessionStopCheckSuperseded = false;
+	#restartSessionStopCheckCancellationEpoch = 0;
 	#postPromptTasksAbortController = new AbortController();
 	/**
 	 * Cancels the current turn's pre-dispatch setup (memory-backend auto-recall and
@@ -1259,6 +1269,10 @@ export class AgentSession implements SettingsScope {
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
 	#sessionStopContinuationCount = 0;
 	#sessionStopHookActive = false;
+	// Settling resets the live chain. A restart rechecks this same answer, not a fresh user turn.
+	#lastSessionStopState:
+		| { assistant: AssistantMessage | undefined; continuationCount: number; stopHookActive: boolean }
+		| undefined;
 	#obfuscator: SecretObfuscator | undefined;
 	/** Last `skillful` value applied to this session; dedupes {@link setSkillful} and its setting watch. */
 	#skillfulApplied = false;
@@ -3447,6 +3461,172 @@ export class AgentSession implements SettingsScope {
 		if (this.#admittedSubmissionCount === 0) return Promise.resolve();
 		this.#admittedSubmissionsSettled ??= Promise.withResolvers<void>();
 		return this.#admittedSubmissionsSettled.promise;
+	}
+	#cancelRestartSessionStopCheck(reason: string): void {
+		this.#restartSessionStopCheckSuperseded = true;
+		this.#restartSessionStopCheckCancellationEpoch++;
+		const controller = this.#restartSessionStopCheckAbortController;
+		if (controller && !controller.signal.aborted) controller.abort(reason);
+	}
+
+	/** Native interrupt handling also invalidates a check not yet dispatched at startup. */
+	interruptRestartSessionStopCheck(): boolean {
+		const pending = this.#restartSessionStopCheckAbortController !== undefined;
+		this.#cancelRestartSessionStopCheck("user interrupted restart check");
+		return pending;
+	}
+
+	#restartSessionStopCheckEligible(): boolean {
+		return (
+			!this.#isDisposed &&
+			!this.#abortInProgress &&
+			!this.#sessionTransitionSettled &&
+			!this.isStreaming &&
+			this.#activeAgentPromptGeneration === this.#promptGeneration &&
+			!this.isBashRunning &&
+			!this.isEvalRunning &&
+			!this.isCompacting &&
+			!this.isGeneratingHandoff &&
+			!this.isRetrying &&
+			!this.hasAdmittedSubmission &&
+			this.#postPromptTasks.size === 0 &&
+			this.#inFlightEventHandlers.size === 0 &&
+			this.#inFlightAgentEndMaintenance.size === 0 &&
+			this.#abortUnwinds.size === 0 &&
+			this.#inFlightSettledCallbacks.length === 0 &&
+			!this.#hasPendingAsyncWake() &&
+			!this.#irc.hasPending() &&
+			!this.hasPendingBashMessages &&
+			!this.hasPendingPythonMessages &&
+			this.#pendingNextTurnMessages.every(isDisplayOnlyCustomMessage) &&
+			this.agent.peekSteeringQueue().length === 0 &&
+			this.agent.peekFollowUpQueue().length === 0 &&
+			this.agent.peekUndeliveredQueuedMessages().length === 0
+		);
+	}
+
+	/**
+	 * Arm one restart-only session_stop evaluation against the persisted settled
+	 * answer. The returned journal entry id is the only value the host carries
+	 * across its native restart.
+	 */
+	async prepareRestartSessionStopCheck(): Promise<string | undefined> {
+		if (
+			!this.#restartSessionStopCheckEligible() ||
+			this.hasPendingDeferredExtensions ||
+			this.#pendingMCPDiscovery ||
+			this.#agentKind === "sub" ||
+			!this.#extensionRunner?.hasHandlers("session_stop") ||
+			!this.sessionManager.isSessionOnDisk()
+		) {
+			return undefined;
+		}
+		const branch = this.sessionManager.getBranchView();
+		let assistantEntry: SessionMessageEntry | undefined;
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.type !== "message") continue;
+			assistantEntry = entry;
+			break;
+		}
+		const latestMessage = this.agent.state.messages.at(-1);
+		if (
+			assistantEntry?.type !== "message" ||
+			assistantEntry.message.role !== "assistant" ||
+			assistantEntry.message.stopReason !== "stop" ||
+			latestMessage?.role !== "assistant" ||
+			latestMessage.stopReason !== "stop"
+		) {
+			return undefined;
+		}
+		const cancellationEpoch = this.#restartSessionStopCheckCancellationEpoch;
+		const stoppedState =
+			this.#lastSessionStopState?.assistant === latestMessage ? this.#lastSessionStopState : undefined;
+		try {
+			const token = await createRestartSessionStopCheck(this.sessionManager, {
+				continuationCount: stoppedState?.continuationCount ?? this.#sessionStopContinuationCount,
+				stopHookActive: stoppedState?.stopHookActive ?? this.#sessionStopHookActive,
+			});
+			return token &&
+				this.#restartSessionStopCheckCancellationEpoch === cancellationEpoch &&
+				this.#restartSessionStopCheckEligible() &&
+				!this.hasPendingDeferredExtensions &&
+				!this.#pendingMCPDiscovery &&
+				this.#extensionRunner?.hasHandlers("session_stop") === true &&
+				this.sessionManager.isSessionOnDisk()
+				? token
+				: undefined;
+		} catch (error) {
+			logger.warn("Could not persist restart session_stop intent", { error: String(error) });
+			return undefined;
+		}
+	}
+
+	/**
+	 * Consume and evaluate a restart marker once the native host is ready.
+	 * Cancellation remains sticky from admission through the hook boundary.
+	 */
+	async recheckSessionStopAfterRestart(
+		token: string | undefined,
+		canEvaluate: () => boolean = () => true,
+	): Promise<boolean> {
+		if (!token) return false;
+		if (this.#restartSessionStopCheckAbortController) {
+			this.#cancelRestartSessionStopCheck("duplicate restart check");
+			return false;
+		}
+		const controller = new AbortController();
+		if (this.#restartSessionStopCheckSuperseded || this.hasAdmittedSubmission || !canEvaluate()) {
+			controller.abort("restart check began after superseding work");
+		}
+		this.#restartSessionStopCheckAbortController = controller;
+		const sessionId = this.sessionManager.getSessionId();
+		const sessionGeneration = this.#sessionGeneration;
+		const promptGeneration = this.#promptGeneration;
+		const valid = (intent?: RestartSessionStopCheckIntent) =>
+			!!intent &&
+			!controller.signal.aborted &&
+			canEvaluate() &&
+			this.#restartSessionStopCheckEligible() &&
+			this.sessionManager.getSessionId() === sessionId &&
+			this.#sessionGeneration === sessionGeneration &&
+			this.#promptGeneration === promptGeneration &&
+			isRestartSessionStopCheckCurrent(this.sessionManager, token, intent);
+		try {
+			// Load deferred handlers only for a valid, durably consumed marker.
+			// Missing or ordinary startup markers have no extension side effects.
+			await this.waitForIdle();
+			await this.waitForAdmittedSubmissions();
+			let intent: RestartSessionStopCheckIntent | undefined;
+			try {
+				intent = await consumeRestartSessionStopCheck(this.sessionManager, token);
+			} catch (error) {
+				logger.warn("Could not consume restart session_stop intent", { error: String(error) });
+				return false;
+			}
+			if (!intent) return false;
+			try {
+				if (this.hasPendingDeferredExtensions) await this.loadDeferredExtensions();
+			} catch (error) {
+				logger.warn("Could not load deferred handlers for restart session_stop", { error: String(error) });
+				return false;
+			}
+			if (!valid(intent) || this.#agentKind === "sub" || !this.#extensionRunner?.hasHandlers("session_stop")) {
+				return false;
+			}
+			this.#sessionStopContinuationCount = intent.continuationCount;
+			this.#sessionStopHookActive = intent.stopHookActive;
+			return await this.#emitSessionStopEvent(this.agent.state.messages, this.getLastAssistantMessage(), {
+				restartCheck: {
+					signal: controller.signal,
+					isValid: () => valid(intent),
+				},
+			});
+		} finally {
+			if (this.#restartSessionStopCheckAbortController === controller) {
+				this.#restartSessionStopCheckAbortController = undefined;
+			}
+		}
 	}
 
 	async #admitSubmission<T>(work: () => Promise<T>): Promise<T> {
@@ -5665,8 +5845,14 @@ export class AgentSession implements SettingsScope {
 	async #emitSessionStopEvent(
 		messages: AgentMessage[],
 		lastAssistantMessage = this.getLastAssistantMessage(),
+		options?: { restartCheck?: { signal: AbortSignal; isValid: () => boolean } },
 	): Promise<boolean> {
-		if (this.#abortInProgress || this.#isDisposed || this.#activeAgentPromptGeneration !== this.#promptGeneration) {
+		if (
+			this.#abortInProgress ||
+			this.#isDisposed ||
+			this.#activeAgentPromptGeneration !== this.#promptGeneration ||
+			(options?.restartCheck && !options.restartCheck.isValid())
+		) {
 			this.#resetSessionStopContinuationState();
 			return false;
 		}
@@ -5681,12 +5867,25 @@ export class AgentSession implements SettingsScope {
 			session_id: this.sessionId,
 			session_file: this.sessionFile,
 			stop_hook_active: this.#sessionStopHookActive,
-			signal: this.#postPromptTasksAbortController.signal,
+			signal: options?.restartCheck
+				? AbortSignal.any([this.#postPromptTasksAbortController.signal, options.restartCheck.signal])
+				: this.#postPromptTasksAbortController.signal,
 		});
-		if (this.#promptGeneration !== generation || this.#abortInProgress || this.#isDisposed) {
-			this.#resetSessionStopContinuationState();
+		if (options?.restartCheck) await this.waitForAdmittedSubmissions();
+		if (
+			this.#promptGeneration !== generation ||
+			this.#abortInProgress ||
+			this.#isDisposed ||
+			(options?.restartCheck && !options.restartCheck.isValid())
+		) {
+			if (!options?.restartCheck) this.#resetSessionStopContinuationState();
 			return false;
 		}
+		this.#lastSessionStopState = {
+			assistant: this.getLastAssistantMessage(),
+			continuationCount: this.#sessionStopContinuationCount,
+			stopHookActive: this.#sessionStopHookActive,
+		};
 		const additionalContext = this.#sessionStopContinuationContext(result);
 		if (!additionalContext) {
 			this.#resetSessionStopContinuationState();
@@ -5892,6 +6091,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	#beginSessionTransition(): Disposable {
+		this.#cancelRestartSessionStopCheck("session transition started");
 		if (this.#sessionTransitionDepth++ === 0) {
 			const settled = Promise.withResolvers<void>();
 			this.#sessionTransitionSettled = settled.promise;
@@ -6089,6 +6289,7 @@ export class AgentSession implements SettingsScope {
 	 * gap slips past the disposal guards.
 	 */
 	beginDispose(): void {
+		this.#cancelRestartSessionStopCheck("session disposed");
 		this.#isDisposed = true;
 		for (const dispose of this.#disposers.splice(0)) dispose();
 		this.#modelDiscoveryAbortController.abort();
@@ -6452,6 +6653,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	freshSession(): FreshSessionResult | undefined {
+		this.#cancelRestartSessionStopCheck("provider session identity changed");
 		if (this.isStreaming) return undefined;
 		const previousSessionId = this.sessionId;
 		const closedProviderSessions = this.#providerSessionState.size;
@@ -7962,6 +8164,7 @@ export class AgentSession implements SettingsScope {
 	 * {@link PromptDroppedError} instead.
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
+		this.#cancelRestartSessionStopCheck("prompt submitted");
 		return this.#admitSubmission(() => this.#prompt(text, options));
 	}
 
@@ -8278,6 +8481,7 @@ export class AgentSession implements SettingsScope {
 			queueOnly?: boolean;
 		},
 	): Promise<boolean> {
+		this.#cancelRestartSessionStopCheck("custom prompt submitted");
 		return this.#admitSubmission(() => this.#promptCustomMessage(message, options));
 	}
 
@@ -8939,6 +9143,9 @@ export class AgentSession implements SettingsScope {
 				// OMP-owned Chromium alive (#5643).
 				void this.dispose().finally(() => process.exit(0));
 			},
+			restart: () => {
+				throw new Error("This extension host does not support session restart");
+			},
 			resolvePlanReview: () => false,
 			getPendingPlanReview: () => undefined,
 			openPlanReview: async () => false,
@@ -9046,6 +9253,7 @@ export class AgentSession implements SettingsScope {
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
 	async steer(text: string, images?: ImageContent[], options?: SteerOptions): Promise<void> {
+		this.#cancelRestartSessionStopCheck("steer submitted");
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -9069,6 +9277,7 @@ export class AgentSession implements SettingsScope {
 	 * flipping advisor auto-resume.
 	 */
 	async followUp(text: string, images?: ImageContent[], options?: FollowUpOptions): Promise<void> {
+		if (!options?.synthetic) this.#cancelRestartSessionStopCheck("follow-up submitted");
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -9141,6 +9350,7 @@ export class AgentSession implements SettingsScope {
 		images?: ImageContent[],
 		options?: { queue?: "steering" | "followUp" },
 	): Promise<boolean> {
+		this.#cancelRestartSessionStopCheck("active-turn input submitted");
 		// Liveness first: an idle session hands the content back
 		// (`promptRequired` at the ACP bridge) without validating it — the
 		// host resubmits through session/prompt, the only path that can
@@ -9279,6 +9489,7 @@ export class AgentSession implements SettingsScope {
 			promptGeneration?: number;
 		},
 	): Promise<boolean> {
+		this.#cancelRestartSessionStopCheck("user message admitted");
 		const attribution = options?.attribution ?? "user";
 		const timestamp = options?.timestamp;
 		const rawText = options?.rawText ?? text;
@@ -9624,6 +9835,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	queueDeferredMessage(message: CustomMessage): void {
+		this.#cancelRestartSessionStopCheck("deferred turn message queued");
 		this.#queueHiddenNextTurnMessage(message, true);
 	}
 
@@ -9855,6 +10067,13 @@ export class AgentSession implements SettingsScope {
 			acceptTerminalEmptyStop?: boolean;
 		},
 	): Promise<boolean> {
+		if (
+			options?.triggerTurn === true ||
+			(options?.deliverAs !== undefined &&
+				!(options.deliverAs === "nextTurn" && isDisplayOnlyCustomMessage(message)))
+		) {
+			this.#cancelRestartSessionStopCheck("custom turn message submitted");
+		}
 		return this.#admitSubmission(() => this.#sendCustomMessage(message, options));
 	}
 
@@ -10845,6 +11064,7 @@ export class AgentSession implements SettingsScope {
 		/** Internal `/compact` startup keeps the manual-compaction marker alive while aborting the active turn. */
 		preserveCompaction?: boolean;
 	}): Promise<void> {
+		this.#cancelRestartSessionStopCheck("session aborted");
 		const userInterrupt = options?.reason === USER_INTERRUPT_LABEL;
 		this.#pendingAbortErrorId = userInterrupt ? AIError.create(AIError.Flag.UserInterrupt) : undefined;
 		if (userInterrupt) this.#advisors.autoResumeSuppressed = true;
@@ -12122,6 +12342,7 @@ export class AgentSession implements SettingsScope {
 
 	/** Retry the last failed assistant turn when the session is idle. */
 	async retry(): Promise<boolean> {
+		this.#cancelRestartSessionStopCheck("retry submitted");
 		const didRetry = await this.#recovery.retry();
 		// A manual retry is the user resuming the run they interrupted, so it lifts the
 		// interrupt's auto-resume suppression the same way a typed prompt does.

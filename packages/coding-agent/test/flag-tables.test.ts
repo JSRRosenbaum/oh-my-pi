@@ -238,6 +238,14 @@ describe("foreign session import flags", () => {
 });
 
 describe("restartArgv (/restart relaunch argv)", () => {
+	it("parses the internal restart token and strips it from every subsequent relaunch", () => {
+		const args = parseArgs(["--restart-session-stop-check", "entry-id"]);
+		expect(args.restartSessionStopCheck).toBe("entry-id");
+		expect(
+			restartArgv(["--restart-session-stop-check", "entry-id", "--restart-session-stop-check=stale"], "sid"),
+		).toEqual(["--resume", "sid"]);
+	});
+
 	it("keeps configuration flags, drops positionals, and appends --resume", () => {
 		expect(restartArgv(["--model", "gpt-5", "fix the bug", "@notes.md"], "sid")).toEqual([
 			"--model",

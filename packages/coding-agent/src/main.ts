@@ -395,7 +395,7 @@ export async function submitInteractiveInput(
 		| "markPendingSubmissionStarted"
 		| "finishPendingSubmission"
 		| "showError"
-		| "checkShutdownRequested"
+		| "checkLifecycleRequested"
 		| "skillCommands"
 		| "renderOptimisticSkillMessage"
 		| "clearOptimisticSkillMessage"
@@ -487,7 +487,7 @@ export async function submitInteractiveInput(
 		mode.showError(errorMessage);
 	} finally {
 		mode.finishPendingSubmission(input);
-		await mode.checkShutdownRequested();
+		await mode.checkLifecycleRequested();
 	}
 }
 
@@ -637,6 +637,7 @@ async function runInteractiveMode(
 	startupGoal?: string,
 	startupRestore?: () => Promise<RestoreOutcome>,
 	refreshScopedModelsAfterLogin?: () => Promise<void>,
+	restartSessionStopCheck?: string,
 ): Promise<void> {
 	const InteractiveModeConstructor = await loadInteractiveModeConstructor();
 	let mode: InteractiveMode;
@@ -817,6 +818,26 @@ async function runInteractiveMode(
 		} catch (error: unknown) {
 			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 			mode.showError(errorMessage);
+		}
+	}
+
+	if (restartSessionStopCheck !== undefined) {
+		try {
+			using _keepalive = new EventLoopKeepalive();
+			await session.recheckSessionStopAfterRestart(
+				restartSessionStopCheck,
+				() =>
+					!mode.isShuttingDown &&
+					mode.lifecycleRequest === undefined &&
+					!mode.hasPendingSubmission() &&
+					startupGoal === undefined &&
+					startupRestore === undefined &&
+					initialMessage === undefined &&
+					initialMessages.length === 0 &&
+					joinLink === undefined,
+			);
+		} catch (error: unknown) {
+			mode.showError(error instanceof Error ? error.message : "Restart stop check failed");
 		}
 	}
 
@@ -2720,6 +2741,7 @@ export async function runRootCommand(
 						initialArgs.goal,
 						parsedArgs.restore ? () => restoreSession(session, { eventBus, subagentEventBus }) : undefined,
 						refreshScopedModelsAfterLogin,
+						parsedArgs.restartSessionStopCheck,
 					);
 				} finally {
 					startupLease?.dispose();

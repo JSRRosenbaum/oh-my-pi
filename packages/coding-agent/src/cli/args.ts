@@ -69,8 +69,9 @@ export interface Args {
 	sessionDir?: string;
 	providerSessionId?: string;
 	providerPromptCacheKey?: string;
+	/** Internal one-shot journal token for native restart stop-hook recheck. */
+	restartSessionStopCheck?: string;
 	fork?: string;
-	/** Collab link to join at startup (set by the `join` subcommand; no CLI flag). */
 	join?: string;
 	models?: string[];
 	tools?: string[];

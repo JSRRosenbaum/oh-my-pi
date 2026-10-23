@@ -16,6 +16,7 @@ async function createHost(initializeUi: boolean) {
 		queued: 0,
 		asyncWork: false,
 		closed: false,
+		closeActions: [] as Array<"shutdown" | "restart">,
 		admitted: 0,
 		pendingSubmission: false,
 		settleAdmitted: undefined as (() => void) | undefined,
@@ -35,7 +36,7 @@ async function createHost(initializeUi: boolean) {
 		async emit() {},
 	};
 	const host = Object.assign(Object.create(InteractiveMode.prototype), {
-		shutdownRequested: false,
+		lifecycleRequest: undefined,
 		syncComposerShape() {},
 		session: {
 			extensionRunner: runner,
@@ -60,6 +61,11 @@ async function createHost(initializeUi: boolean) {
 		hasPendingSubmission: () => state.pendingSubmission,
 		async shutdown() {
 			state.closed = true;
+			state.closeActions.push("shutdown");
+		},
+		async restart() {
+			state.closed = true;
+			state.closeActions.push("restart");
 		},
 		showError(message: string) {
 			errors.push(message);
@@ -75,8 +81,8 @@ async function createHost(initializeUi: boolean) {
 	const controller = new ExtensionUiController(host);
 	if (initializeUi) await controller.initHooksAndCustomTools();
 	else controller.initializeHookRunner({} as ExtensionUIContext, false);
-	if (!actions) throw new Error("Extension runtime was not initialized");
-	return { host, actions, state, errors };
+	if (!actions?.restart) throw new Error("Extension restart runtime was not initialized");
+	return { host, actions, requestRestart: actions.restart, state, errors };
 }
 
 async function flushShutdown() {
@@ -111,16 +117,16 @@ describe("interactive extension shutdown", () => {
 
 		state.streaming = false;
 		state.queued = 1;
-		await host.checkShutdownRequested();
+		await host.checkLifecycleRequested();
 		expect(state.closed).toBe(false);
 
 		state.queued = 0;
 		state.asyncWork = true;
-		await host.checkShutdownRequested();
+		await host.checkLifecycleRequested();
 		expect(state.closed).toBe(false);
 
 		state.asyncWork = false;
-		host.requestShutdown();
+		host.requestLifecycle("shutdown");
 		await flushShutdown();
 		expect(state.closed).toBe(true);
 		expect(errors).toEqual([]);
@@ -141,7 +147,7 @@ describe("interactive extension shutdown", () => {
 		expect(state.closed).toBe(false);
 
 		state.streaming = false;
-		host.requestShutdown();
+		host.requestLifecycle("shutdown");
 		await flushShutdown();
 		expect(state.closed).toBe(true);
 		expect(errors).toEqual([]);
@@ -155,8 +161,101 @@ describe("interactive extension shutdown", () => {
 		expect(state.closed).toBe(false);
 
 		state.pendingSubmission = false;
-		await host.checkShutdownRequested();
+		await host.checkLifecycleRequested();
 		expect(state.closed).toBe(true);
 		expect(errors).toEqual([]);
+	});
+});
+
+describe("interactive extension restart", () => {
+	test("an idle request reuses native restart once without terminal input", async () => {
+		const { host, requestRestart, state, errors } = await createHost(true);
+		requestRestart();
+		requestRestart();
+		await flushShutdown();
+		await host.checkLifecycleRequested();
+		expect(state.closeActions).toEqual(["restart"]);
+		expect(errors).toEqual([]);
+	});
+
+	test("a rebound hook runtime can request restart", async () => {
+		const { requestRestart, state } = await createHost(false);
+		requestRestart();
+		await flushShutdown();
+		expect(state.closeActions).toEqual(["restart"]);
+	});
+
+	test("does not drop queued input or stop accepted background work to restart", async () => {
+		const { host, requestRestart, state } = await createHost(true);
+		state.streaming = true;
+		state.queued = 1;
+		state.asyncWork = true;
+		requestRestart();
+		await flushShutdown();
+		expect(state.closeActions).toEqual([]);
+		expect(state.queued).toBe(1);
+		expect(state.asyncWork).toBe(true);
+
+		state.streaming = false;
+		await host.checkLifecycleRequested();
+		expect(state.closeActions).toEqual([]);
+		state.queued = 0;
+		await host.checkLifecycleRequested();
+		expect(state.closeActions).toEqual([]);
+		state.asyncWork = false;
+		await host.checkLifecycleRequested();
+		expect(state.closeActions).toEqual(["restart"]);
+	});
+
+	test("waits for admitted input and the turn it starts before restarting", async () => {
+		const { host, requestRestart, state } = await createHost(true);
+		state.admitted = 1;
+		requestRestart();
+		await flushShutdown();
+		expect(state.closeActions).toEqual([]);
+
+		state.streaming = true;
+		state.admitted = 0;
+		state.settleAdmitted?.();
+		await flushShutdown();
+		expect(state.closeActions).toEqual([]);
+		state.streaming = false;
+		await host.checkLifecycleRequested();
+		expect(state.closeActions).toEqual(["restart"]);
+	});
+
+	test("retains a restart while foreground input is being prepared", async () => {
+		const { host, requestRestart, state } = await createHost(true);
+		state.pendingSubmission = true;
+		requestRestart();
+		await flushShutdown();
+		expect(state.closeActions).toEqual([]);
+		state.pendingSubmission = false;
+		await host.checkLifecycleRequested();
+		expect(state.closeActions).toEqual(["restart"]);
+	});
+
+	test("shutdown overrides a pending restart without waiting on another session", async () => {
+		const { host, actions, requestRestart, state } = await createHost(true);
+		state.asyncWork = true;
+		requestRestart();
+		await flushShutdown();
+		actions.shutdown();
+		await flushShutdown();
+		state.asyncWork = false;
+		await host.checkLifecycleRequested();
+		expect(state.closeActions).toEqual(["shutdown"]);
+	});
+
+	test("a later restart cannot override a pending shutdown", async () => {
+		const { host, actions, requestRestart, state } = await createHost(true);
+		state.asyncWork = true;
+		actions.shutdown();
+		await flushShutdown();
+		requestRestart();
+		await flushShutdown();
+		state.asyncWork = false;
+		await host.checkLifecycleRequested();
+		expect(state.closeActions).toEqual(["shutdown"]);
 	});
 });

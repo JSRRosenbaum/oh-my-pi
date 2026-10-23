@@ -87,7 +87,7 @@ import type { CollabUiRequestDraft } from "@oh-my-pi/pi-wire";
 import type { RemoteDialogHost, RemoteDialogRequest, RemoteDialogResponse } from "./remote-dialogs";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import { appKey, editorKey, rawKeyHint } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
-import { formatModelString, type ResolvedModelRoleValue } from "../config/model-resolver";
+import { formatModelString, formatModelStringWithRouting, type ResolvedModelRoleValue } from "../config/model-resolver";
 import { isSettingsInitialized, Settings, settings } from "../config/settings";
 import { clearClaudePluginRootsCache } from "../discovery/helpers";
 import type {
@@ -1583,7 +1583,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	/** Owns Esc for every `/mcp test` that is active or whose cancellation hint may still be visible. */
 	mcpTestEscapeHandlers = new Set<() => void>();
 	lastLeftTapTime = 0;
-	shutdownRequested = false;
+	lifecycleRequest: "shutdown" | "restart" | undefined;
 	#isShuttingDown = false;
 	/**
 	 * Set once a graceful {@link shutdown} teardown threw. The teardown is
@@ -7487,7 +7487,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	/**
 	 * Tear down like {@link shutdown}, then relaunch the CLI with the original
 	 * launch argv (session-source flags and positional prompts stripped, see
-	 * {@link restartArgv}), resuming this session when it exists on disk.
+	 * {@link restartArgv}), overriding stale model/thinking flags with the current
+	 * selection and resuming this session when it exists on disk.
 	 *
 	 * On POSIX the relaunch is a true `execvp(3)` image replacement: same PID,
 	 * same terminal, no lingering parent. Postmortem cleanups and stdout are
@@ -7497,8 +7498,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	 */
 	async restart(): Promise<void> {
 		if (this.#isShuttingDown) return;
+		// Disposal releases runtime state; snapshot the current selection, not
+		// launch-time flags that may have since been changed.
+		const model = this.session.model;
+		const thinking = this.session.configuredThinkingLevel() ?? ThinkingLevel.Off;
 		this.#beginClose();
+		let restartSessionStopCheck: string | undefined;
 		try {
+			restartSessionStopCheck = await this.session.prepareRestartSessionStopCheck();
 			await this.#teardown("restart");
 		} catch (error) {
 			this.#handleTeardownError("restart", error);
@@ -7508,14 +7515,19 @@ export class InteractiveMode implements InteractiveModeContext {
 		const sessionFile = this.sessionManager.isSessionOnDisk() ? this.sessionManager.getSessionFile() : undefined;
 		// Pass the profile explicitly: native exec does not inherit Bun's process.env updates.
 		const activeProfile = getActiveProfile();
+		const replacedFlags: Record<string, true> = { "--thinking": true };
+		if (model) {
+			replacedFlags["--model"] = true;
+			replacedFlags["--provider"] = true;
+		}
+		if (activeProfile) replacedFlags["--profile"] = true;
 		const cmd = [
 			...resolveCliEntryCmd(),
-			...restartArgv(
-				process.argv.slice(2),
-				sessionFile ? path.resolve(sessionFile) : undefined,
-				activeProfile ? { "--profile": true } : undefined,
-			),
+			...restartArgv(process.argv.slice(2), sessionFile ? path.resolve(sessionFile) : undefined, replacedFlags),
 		];
+		if (restartSessionStopCheck) cmd.push("--restart-session-stop-check", restartSessionStopCheck);
+		if (model) cmd.push("--model", formatModelStringWithRouting(model));
+		cmd.push("--thinking", thinking);
 		if (activeProfile) cmd.push("--profile", activeProfile);
 		await postmortem.cleanup();
 		await postmortem.drainStdout();
@@ -7627,12 +7639,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.stop();
 	}
 
-	requestShutdown(): void {
-		this.shutdownRequested = true;
-		// Background extensions do not submit terminal input. Start the same
-		// settled-boundary check without waiting for another user keystroke.
-		void this.checkShutdownRequested().catch(error => {
-			this.showError(`Shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+	requestLifecycle(request: "shutdown" | "restart"): void {
+		if (this.isShuttingDown) return;
+		// An explicit exit must never turn back into a restart.
+		if (this.lifecycleRequest !== "shutdown") this.lifecycleRequest = request;
+		// Background extensions do not submit terminal input. Both terminal
+		// requests share the same local admission and settled-boundary checks.
+		void this.checkLifecycleRequested().catch(error => {
+			this.showError(`Session close failed: ${error instanceof Error ? error.message : String(error)}`);
 		});
 	}
 
@@ -7641,8 +7655,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#pendingSubmittedInput !== undefined;
 	}
 
-	async checkShutdownRequested(): Promise<void> {
-		if (!this.shutdownRequested || this.isShuttingDown) return;
+	async checkLifecycleRequested(): Promise<void> {
+		if (!this.lifecycleRequest || this.isShuttingDown) return;
 		// Quiesce in a loop: an admitted submission that settles may have started a turn
 		// whose recovery work waitForIdle() must observe again before the final decision.
 		for (;;) {
@@ -7650,8 +7664,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (!this.session.hasAdmittedSubmission) break;
 			await this.session.waitForAdmittedSubmissions();
 		}
-		// No await between this check and shutdown(): the decision and the start of
-		// teardown share one microtask, so nothing can be admitted in between.
+		// No await between this check and the native close: the decision and
+		// teardown start share one microtask, so nothing can be admitted between.
 		if (
 			this.isShuttingDown ||
 			this.hasPendingSubmission() ||
@@ -7662,7 +7676,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		) {
 			return;
 		}
-		await this.shutdown();
+		if (this.lifecycleRequest === "shutdown") await this.shutdown();
+		else await this.restart();
 	}
 
 	// Extension UI integration

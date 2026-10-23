@@ -2324,7 +2324,7 @@ export class EventController {
 		await this.#finishAgentEnd(event);
 		// This settle may belong to an extension-started turn while the main
 		// input loop remains asleep. Do not await session-idle from its own event.
-		if (this.ctx.shutdownRequested) this.ctx.requestShutdown();
+		if (this.ctx.lifecycleRequest) this.ctx.requestLifecycle(this.ctx.lifecycleRequest);
 	}
 
 	/**
@@ -2364,7 +2364,7 @@ export class EventController {
 				}
 				setRunStatus(this.#settledRunStatus(event));
 				await this.#finishAgentEnd(event);
-				if (this.ctx.shutdownRequested) this.ctx.requestShutdown();
+				if (this.ctx.lifecycleRequest) this.ctx.requestLifecycle(this.ctx.lifecycleRequest);
 			});
 		} catch (error) {
 			logger.warn("Non-terminal settle teardown failed", { error: String(error) });

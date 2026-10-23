@@ -162,6 +162,53 @@ describe("ExtensionRunner", () => {
 		expect(runner.createContext().mode).toBe("tui");
 	});
 
+	it("rejects unsupported restart and does not retain a previous host's restart capability", async () => {
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		const actions = {
+			sendMessage: () => {},
+			sendUserMessage: () => {},
+			appendEntry: () => {},
+			setLabel: () => {},
+			getActiveTools: () => [],
+			getAllTools: () => [],
+			setActiveTools: async () => {},
+			getCommands: () => [],
+			setModel: async () => false,
+			getThinkingLevel: () => undefined,
+			setThinkingLevel: () => {},
+			getSessionName: () => undefined,
+			setSessionName: async () => {},
+		};
+		const contextActions = {
+			getModel: () => undefined,
+			isIdle: () => true,
+			abort: () => {},
+			hasPendingMessages: () => false,
+			shutdown: () => {},
+			getContextUsage: () => undefined,
+			compact: async () => {},
+			getSystemPrompt: () => [],
+		};
+		const context = runner.createContext();
+		expect(() => context.restart()).toThrow("This extension host does not support session restart");
+
+		const restart = vi.fn();
+		runner.initialize(actions, { ...contextActions, restart }, undefined, undefined, "tui");
+		context.restart();
+		expect(restart).toHaveBeenCalledTimes(1);
+
+		runner.initialize(actions, contextActions, undefined, undefined, "rpc");
+		expect(() => context.restart()).toThrow("This extension host does not support session restart");
+		expect(restart).toHaveBeenCalledTimes(1);
+	});
+
 	it("uses required context actions when command actions are unavailable", async () => {
 		const result = await loadTestExtensions();
 		const runner = new ExtensionRunner(

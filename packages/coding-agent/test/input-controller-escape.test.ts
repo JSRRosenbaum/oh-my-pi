@@ -163,6 +163,7 @@ function createContext(): {
 			customCommands: [],
 			promptTemplates: [],
 			abort,
+			interruptRestartSessionStopCheck: () => false,
 			abortBash,
 			abortEval,
 			clearQueue,

@@ -26,6 +26,8 @@ import { TtsrManager } from "@oh-my-pi/pi-coding-agent/export/ttsr";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
+import type { SessionShutdownEvent } from "@oh-my-pi/pi-coding-agent/extensibility/shared-events";
+import { createSessionTeardown } from "@oh-my-pi/pi-coding-agent/modes/session-teardown";
 import { GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -345,6 +347,57 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.waitForIdle();
 
 		expect(emitSessionStop).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		{ shutdownReason: undefined, expected: "quit" },
+		{ shutdownReason: "restart" as const, expected: "restart" },
+	])("emits one $expected shutdown event through actual disposal", async ({ shutdownReason, expected }) => {
+		const observed: SessionShutdownEvent[] = [];
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.on("session_shutdown", event => {
+					observed.push(event);
+				});
+			},
+			tempDir,
+			new EventBus(),
+			runtime,
+			"shutdown-reason",
+		);
+		const sessionManager = SessionManager.inMemory(tempDir);
+		const extensionRunner = new ExtensionRunner(
+			[extension],
+			runtime,
+			tempDir,
+			sessionManager,
+			sharedModelRegistry,
+		);
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model: getBundledModel("anthropic", "claude-sonnet-4-5")!, tools: [] },
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+			extensionRunner,
+		});
+		const teardown = createSessionTeardown({
+			getDraftText: () => "retained draft",
+			beginDispose: () => session.beginDispose(),
+			saveDraft: text => sessionManager.saveDraft(text),
+			disposeSession: (reason, lifecycleReason) => session.dispose({ reason, shutdownReason: lifecycleReason }),
+		});
+		const first = teardown(undefined, shutdownReason);
+		const second = teardown(undefined, "quit");
+		await Promise.all([first, second]);
+		await session.dispose();
+		expect(observed).toEqual([{ type: "session_shutdown", reason: expected }]);
 	});
 
 	it("cancels an active session_stop pass without applying stale continuation feedback", async () => {

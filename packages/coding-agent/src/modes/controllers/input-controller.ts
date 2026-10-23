@@ -571,6 +571,10 @@ export class InputController {
 				}
 				return;
 			}
+			if (this.ctx.session.interruptRestartSessionStopCheck()) {
+				this.#abortStreamingTurn();
+				return;
+			}
 			if (this.ctx.loadingAnimation) {
 				if (this.ctx.cancelPendingSubmission()) {
 					return;
@@ -1533,6 +1537,8 @@ export class InputController {
 			void this.ctx.shutdown();
 			return;
 		}
+
+		if (this.ctx.session.interruptRestartSessionStopCheck()) this.#abortStreamingTurn();
 
 		const now = Date.now();
 		if (now - this.ctx.lastSigintTime < 500) {

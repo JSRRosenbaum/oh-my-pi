@@ -359,6 +359,9 @@ Handlers and tool `execute` receive `ctx` with:
 - `compact(instructionsOrOptions?)`: accepts summary focus text or `CompactOptions`, including one-off `mode: "soft" | "remote" | "snapcompact"`, `onComplete`, `onError`, and `suppressContinuation`
 - `isIdle()`, `hasPendingMessages()`, `abort()`
 - `shutdown()`
+- `restart()`: request a deferred native TUI restart of this session. Finish the current turn after requesting it. Restart waits for streaming, admitted/queued input and native-owned async work; it does not wait for other processes. Current session, model and thinking selection survive the relaunch. Repeated requests coalesce; shutdown takes precedence. Unsupported hosts throw. The request is in-memory, not a crash-durable checkpoint, and does not make extension-owned jobs or external effects replay-safe.
+  A qualifying native restart with a persisted completed assistant answer and installed `session_stop` handlers also arms one post-startup stop-hook check. The handoff binds the session file, active branch boundary and completed answer, and carries the existing continuation count and hook-active state. After startup and admission settlement, core durably consumes the intent before invoking the normal hooks. Fresh sessions and ordinary resumes never trigger this check. New input, abort, session/branch changes, pending work or an invalid boundary suppress stale continuation; hook failures do not retry. A crash after consumption loses the check rather than replaying it. This mechanism does not replay prompts or tools and contains no extension-specific judge policy.
+  Escape and Ctrl+C invalidate the pending startup check through native interrupt handling. Empty, agent-attributed display-only cards are bookkeeping, not superseding model context; a stop hook can publish its result card and still request continuation.
 - `resolvePlanReview(reviewId, choice, input?)`: answer the open interactive plan review; returns `false` when the review or choice is unavailable, `refine` requires non-empty `input.feedback`, and on approvals (`execute`, `compact`, `keep`) `input.role` may name a tier from the event's `tiers` to pick the execution model (an unknown role, or a `role` on any other choice, returns `false`)
 - `getPendingPlanReview()`: the open interactive plan review still awaiting an answer, in the `plan_review_requested` shape, or `undefined`; use it to answer a review that opened before the extension loaded or reconnected
 - `openPlanReview()`: open the interactive plan review on the newest plan file, like `/plan-review`; resolves `true` once a review awaits an answer, without waiting for a choice. An already-open review is kept rather than replaced. Unlike `/plan-review` it never aborts work: it resolves `false`, silently, while the agent is streaming or compacting, when plan mode is inactive, or when no non-empty plan file exists
@@ -463,7 +466,7 @@ Canonical event unions and payload types are in `types.ts`.
 - `session_before_branch` / `session_branch`
 - `session_before_compact` / `session.compacting` / `session_compact`
 - `session_before_tree` / `session_tree`
-- `session_shutdown`
+- `session_shutdown`: `reason` is `"restart"` for native restart and `"exit"` otherwise. Extensions can retain bindings on restart without suppressing ordinary exit cleanup; the existing bounded shutdown-handler budget still applies.
 
 In the interactive TUI, an extension whose factory registers no providers,
 shortcuts, composer shapes, or file fallbacks is loaded after the composer

@@ -283,7 +283,7 @@ export interface InteractiveModeContext {
 	/** Owns Esc for every `/mcp test` that is active or whose cancellation hint may still be visible. */
 	mcpTestEscapeHandlers: Set<() => void>;
 	lastLeftTapTime: number;
-	shutdownRequested: boolean;
+	lifecycleRequest: "shutdown" | "restart" | undefined;
 	/** True once `shutdown()` has started. Read-only from the context;
 	 *  controllers use this to skip work that races with teardown. */
 	readonly isShuttingDown: boolean;
@@ -306,9 +306,9 @@ export interface InteractiveModeContext {
 	shutdown(): Promise<void>;
 	/** Tear down like {@link shutdown}, then relaunch the CLI with the original launch flags, resuming this session. */
 	restart(): Promise<void>;
-	/** Request graceful shutdown at the next fully settled boundary, including background turns. */
-	requestShutdown(): void;
-	checkShutdownRequested(): Promise<void>;
+	/** Request a local safe-boundary close; shutdown takes precedence over restart. */
+	requestLifecycle(request: "shutdown" | "restart"): void;
+	checkLifecycleRequested(): Promise<void>;
 
 	// Extension UI integration
 	setToolUIContext(uiContext: ExtensionUIContext, hasUI: boolean): void;

@@ -19,6 +19,8 @@ import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
+import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import * as titleGenerator from "@oh-my-pi/pi-coding-agent/utils/title-generator";
@@ -333,14 +335,14 @@ function asyncWaitEnd(): Extract<AgentSessionEvent, { type: "agent_end" }> {
 }
 
 /** Session whose owned background job is pending until `drain()` settles it without delivering a wake. */
-function makeAsyncWaitContext() {
+function makeAsyncWaitContext(hasAdmittedSubmission = true) {
 	let pending = true;
 	const settled = Promise.withResolvers<void>();
 	const ctx = createInteractiveModeContext({
 		sessionManager: { getSessionName: () => "test-session" },
 		session: {
 			// The real settle is emitted while its prompt is still admitted.
-			hasAdmittedSubmission: true,
+			hasAdmittedSubmission,
 			hasPendingAsyncWork: () => pending,
 			settleAsyncWork: () => settled.promise,
 		},
@@ -358,6 +360,61 @@ async function nextMacrotask(): Promise<void> {
 	setImmediate(resolve);
 	await promise;
 }
+
+/** Use the real native lifecycle gate; only replace the terminal process effect. */
+function bindNativeLifecycle(ctx: InteractiveModeContext) {
+	let closed = false;
+	Object.defineProperty(ctx, "isShuttingDown", { get: () => closed });
+	ctx.requestLifecycle = InteractiveMode.prototype.requestLifecycle;
+	ctx.checkLifecycleRequested = InteractiveMode.prototype.checkLifecycleRequested;
+	Object.defineProperty(ctx, "hasPendingSubmission", { value: () => false });
+	const restart = vi.fn(async () => {
+		closed = true;
+	});
+	ctx.restart = restart;
+	return restart;
+}
+
+describe("EventController — deferred extension restart", () => {
+	it("restarts once after a terminal settle without another terminal submission", async () => {
+		let streaming = true;
+		const ctx = createInteractiveModeContext({
+			session: {
+				get isStreaming() {
+					return streaming;
+				},
+				hasAdmittedSubmission: false,
+			},
+		});
+		const restart = bindNativeLifecycle(ctx);
+		const controller = new EventController(ctx);
+		ctx.requestLifecycle("restart");
+		await nextMacrotask();
+		expect(restart).not.toHaveBeenCalled();
+
+		streaming = false;
+		await controller.handleEvent(makeAgentEndEvent([]));
+		await nextMacrotask();
+		expect(restart).toHaveBeenCalledTimes(1);
+		await controller.handleEvent(makeAgentEndEvent([]));
+		await nextMacrotask();
+		expect(restart).toHaveBeenCalledTimes(1);
+	});
+
+	it("rechecks restart when owned background work settles without delivering a wake", async () => {
+		const { ctx, drain } = makeAsyncWaitContext(false);
+		const restart = bindNativeLifecycle(ctx);
+		const controller = new EventController(ctx);
+		ctx.requestLifecycle("restart");
+		await controller.handleEvent(asyncWaitEnd());
+		await nextMacrotask();
+		expect(restart).not.toHaveBeenCalled();
+
+		drain();
+		await nextMacrotask();
+		expect(restart).toHaveBeenCalledTimes(1);
+	});
+});
 
 describe("EventController — terminal title across a non-terminal agent_end", () => {
 	it("keeps the working title and skips loader teardown but still flushes a deferred model switch during a scheduled continuation (isTerminal:false, not yielded), then tears down if it is cancelled before starting", async () => {

@@ -7,6 +7,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
+import { loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { postmortem, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
@@ -37,6 +38,49 @@ describe("createAgentSession dispose releases postmortem registrations", () => {
 
 	afterEach(() => {
 		vi.restoreAllMocks();
+	});
+
+	it("lets extensions distinguish restart from exit through the SDK session lifecycle", async () => {
+		const extensionPath = path.join(tempDir, "shutdown-reason.ts");
+		const receiptPath = path.join(tempDir, "shutdown-reason.json");
+		fs.writeFileSync(
+			extensionPath,
+			`export default function(pi) {
+				pi.on("session_shutdown", event => Bun.write(${JSON.stringify(receiptPath)}, JSON.stringify(event)));
+			}`,
+		);
+		const preloadedExtensions = await loadExtensions([extensionPath], tempDir);
+		expect(preloadedExtensions.errors).toEqual([]);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({}),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: true,
+			bindProcessState: false,
+			preloadedExtensions,
+			disableExtensionDiscovery: true,
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			rules: [],
+			preloadedCustomToolPaths: [],
+		});
+		try {
+			await session.dispose({ shutdownReason: "restart" });
+			expect(JSON.parse(fs.readFileSync(receiptPath, "utf8"))).toEqual({
+				type: "session_shutdown",
+				reason: "restart",
+			});
+		} finally {
+			await session.dispose();
+		}
 	});
 
 	it("does not accumulate registrations across create/dispose cycles of MCP-owning sessions", async () => {

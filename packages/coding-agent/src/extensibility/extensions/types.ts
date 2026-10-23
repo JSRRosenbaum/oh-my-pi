@@ -715,6 +715,13 @@ export interface ExtensionContext {
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
 	/**
+	 * Request a restart of this interactive CLI session at the next safe local
+	 * boundary. Accepted input and background work finish first; the current
+	 * session is resumed with the native restart launch flags. Shutdown takes
+	 * precedence over a pending restart. Throws when the host cannot restart.
+	 */
+	restart(): void;
+	/**
 	 * Answer the open interactive plan review as if the operator picked `choice` in it.
 	 * `refine` needs non-empty `input.feedback`, which is sent as the next planning prompt.
 	 * `save` writes the plan under its default file name without the path prompt.
@@ -2203,6 +2210,8 @@ export interface ExtensionContextActions {
 	abort: () => void;
 	hasPendingMessages: () => boolean;
 	shutdown: () => void;
+	/** Optional host capability; the runner throws when restart is unsupported. */
+	restart?: () => void;
 	resolvePlanReview?: (
 		reviewId: string,
 		choice: PlanReviewChoice,

@@ -106,7 +106,7 @@ function createMode(options?: { pendingStart?: boolean; skillCommands?: Map<stri
 		markPendingSubmissionStarted: vi.fn(() => options?.pendingStart ?? true),
 		finishPendingSubmission: vi.fn(),
 		showError: vi.fn(),
-		checkShutdownRequested: vi.fn(async () => {}),
+		checkLifecycleRequested: vi.fn(async () => {}),
 		skillCommands: options?.skillCommands ?? new Map<string, Skill>(),
 		optimisticSkillMessagePending: false,
 		renderOptimisticSkillMessage: vi.fn(),

@@ -188,6 +188,9 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 	"--provider-session-id": (result, value) => {
 		result.providerSessionId = value;
 	},
+	"--restart-session-stop-check": (result, value) => {
+		result.restartSessionStopCheck = value;
+	},
 	"--prompt-cache-key": (result, value) => {
 		result.providerPromptCacheKey = value;
 	},
@@ -395,6 +398,7 @@ const ONE_SHOT_LAUNCH_FLAGS: Readonly<Record<string, true>> = {
 	"--from-claude": true,
 	"--from-codex": true,
 	"--goal": true,
+	"--restart-session-stop-check": true,
 };
 
 /**
