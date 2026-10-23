@@ -10,6 +10,7 @@
  * is directly unit-testable without instantiating the full TUI stack.
  */
 import { logger, type postmortem } from "@oh-my-pi/pi-utils";
+import type { SessionShutdownEvent } from "../extensibility/shared-events";
 
 /** Dependencies the teardown captures at construction time. */
 export interface SessionTeardownDeps {
@@ -32,7 +33,7 @@ export interface SessionTeardownDeps {
 	 * (undefined on the keypress/`/exit` path) so `AgentSession.dispose()` can
 	 * persist the real exit reason instead of the generic `"dispose"`.
 	 */
-	disposeSession: (reason?: postmortem.Reason) => Promise<void>;
+	disposeSession: (reason?: postmortem.Reason, shutdownReason?: SessionShutdownEvent["reason"]) => Promise<void>;
 }
 
 /**
@@ -41,7 +42,10 @@ export interface SessionTeardownDeps {
  * teardown (`sigterm`, `sighup`, `uncaught_exception`, …); only the FIRST
  * call's reason is used — later callers await the same settled promise.
  */
-export type SessionTeardown = (reason?: postmortem.Reason) => Promise<void>;
+export type SessionTeardown = (
+	reason?: postmortem.Reason,
+	shutdownReason?: SessionShutdownEvent["reason"],
+) => Promise<void>;
 
 /**
  * Build a promise-memoized teardown function. The first call snapshots the
@@ -65,7 +69,10 @@ export type SessionTeardown = (reason?: postmortem.Reason) => Promise<void>;
  */
 export function createSessionTeardown(deps: SessionTeardownDeps): SessionTeardown {
 	let pending: Promise<void> | undefined;
-	const run = async (reason?: postmortem.Reason): Promise<void> => {
+	const run = async (
+		reason?: postmortem.Reason,
+		shutdownReason: SessionShutdownEvent["reason"] = "quit",
+	): Promise<void> => {
 		const draftText = deps.getDraftText();
 		deps.beginDispose();
 		try {
@@ -73,10 +80,10 @@ export function createSessionTeardown(deps: SessionTeardownDeps): SessionTeardow
 		} catch (err) {
 			logger.warn("Failed to save session draft during teardown", { error: String(err) });
 		}
-		await deps.disposeSession(reason);
+		await deps.disposeSession(reason, shutdownReason);
 	};
-	return (reason?: postmortem.Reason) => {
-		if (!pending) pending = run(reason);
+	return (reason?: postmortem.Reason, shutdownReason?: SessionShutdownEvent["reason"]) => {
+		if (!pending) pending = run(reason, shutdownReason);
 		return pending;
 	};
 }

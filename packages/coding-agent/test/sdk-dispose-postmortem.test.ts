@@ -89,4 +89,39 @@ describe("createAgentSession dispose releases postmortem registrations", () => {
 
 		expect(live).toEqual(afterFirst);
 	});
+
+	for (const shutdownReason of ["quit", "restart"] as const) {
+		it(`publishes one ${shutdownReason} lifecycle boundary before concurrent SDK disposal completes`, async () => {
+			const observed: string[] = [];
+			const { session } = await createAgentSession({
+				cwd: tempDir,
+				agentDir: tempDir,
+				modelRegistry,
+				sessionManager: SessionManager.inMemory(),
+				settings: Settings.isolated({}),
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				hasUI: true,
+				bindProcessState: false,
+				enableMCP: false,
+				disableExtensionDiscovery: true,
+				extensions: [pi => {
+					pi.on("session_shutdown", event => { observed.push(event.reason); });
+				}],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableLsp: false,
+				skipPythonPreflight: true,
+				rules: [],
+				preloadedCustomToolPaths: [],
+			});
+			try {
+				await Promise.all([session.dispose({ shutdownReason }), session.dispose()]);
+				expect(observed).toEqual([shutdownReason]);
+			} finally {
+				await session.dispose();
+			}
+		});
+	}
 });

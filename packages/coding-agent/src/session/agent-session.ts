@@ -6272,7 +6272,7 @@ export class AgentSession implements SettingsScope {
 		this.#cancelFatalRecoveryHint?.();
 		this.#cancelFatalRecoveryHint = undefined;
 		try {
-			await emitSessionShutdownEvent(this.#extensionRunner);
+			await emitSessionShutdownEvent(this.#extensionRunner, options.shutdownReason);
 		} catch (error) {
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}

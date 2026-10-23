@@ -491,6 +491,14 @@ Replacement sessions emit `session_shutdown` before the transition and
 expires remote-dialog registration without a following `session_start`; hosts
 handling that event must re-register separately.
 
+`/restart` emits `session_shutdown` with `reason: "restart"` before replacing
+the process image; ordinary exit uses `"quit"`. On POSIX, the replacement keeps
+the PID, so PID liveness alone cannot distinguish the old extension runtime
+from its successor. Extensions should settle any authenticated external
+registration handoff within the shutdown handler's existing two-second budget.
+The restarted process emits the normal `"startup"` event against the resumed
+session; an in-memory handoff does not survive process-image replacement.
+
 ### Prompt and turn lifecycle
 
 - `input`

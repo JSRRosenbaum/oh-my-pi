@@ -121,7 +121,7 @@ export interface SessionCompactFailedEvent {
 /** Why the departing extension session is shutting down. */
 export interface SessionShutdownEvent {
 	type: "session_shutdown";
-	reason: "quit" | "reload" | "new" | "resume" | "fork";
+	reason: "quit" | "restart" | "reload" | "new" | "resume" | "fork";
 	/** Destination session file for a replacement when one is known. */
 	targetSessionFile?: string;
 }

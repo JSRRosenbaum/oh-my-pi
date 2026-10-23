@@ -2282,11 +2282,12 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.statusLine.dispose();
 			},
 			saveDraft: text => this.sessionManager.saveDraft(text),
-			disposeSession: async reason => {
+			disposeSession: async (reason, shutdownReason) => {
 				await this.#btwController.dispose();
 				await this.session.dispose({
 					mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS,
 					reason,
+					shutdownReason,
 				});
 			},
 		});
@@ -7498,7 +7499,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.#isShuttingDown) return;
 		this.#beginClose();
 		try {
-			await this.#teardown();
+			await this.#teardown("restart");
 		} catch (error) {
 			this.#handleTeardownError("restart", error);
 			return;
@@ -7562,7 +7563,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	/** Shared `shutdown()`/`restart()` teardown: dispose the session and hand the terminal back. */
-	async #teardown(): Promise<void> {
+	async #teardown(shutdownReason: "quit" | "restart" = "quit"): Promise<void> {
 		// An in-flight loop condition (or a deferred auto-submit timer) must not
 		// outlive session disposal: an unaborted `sleep 30`-style condition can
 		// resolve mid-teardown and drive `#passesLoopCondition` into invoking the
@@ -7596,10 +7597,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			// The teardown is registered lazily in `init()` — a `/exit` reached
 			// before `init()` completed falls back to a direct dispose.
 			if (this.#signalTeardown) {
-				await this.#signalTeardown();
+				await this.#signalTeardown(undefined, shutdownReason);
 			} else {
 				await this.session.dispose({
 					mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS,
+					shutdownReason,
 				});
 			}
 		} finally {

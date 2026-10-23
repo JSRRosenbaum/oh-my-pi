@@ -308,6 +308,14 @@ Related APIs:
 
 Call `await session.dispose()` when the embedder is completely done with a session. `dispose()` starts disposal itself and is idempotent: repeated or concurrent calls receive the same teardown promise, so shutdown events and owned resources are not drained twice.
 
+An embedder preparing an executable restart can use
+`await session.dispose({ shutdownReason: "restart" })` so extensions can preserve
+their external bindings instead of treating the boundary as an ordinary quit.
+This reports the lifecycle boundary; it does not itself relaunch the host.
+The SDK preserves disposal options, and the first disposal call determines the
+single emitted shutdown reason. The separate postmortem `reason` option controls
+the exit diagnostic, not the extension event.
+
 `beginDispose()` is the synchronous admission barrier for wrappers that must await their own teardown before calling `dispose()`. Call it before the wrapper's first `await`; otherwise deferred work can enter the gap. It immediately marks the session disposed, cancels memory startup, title generation, and auto-learn capture, clears queued yield/asides, stops advisor runtime, detaches aside delivery, and rejects new eval executions. Deferred session work checks the disposed state and is dropped or skipped. `beginDispose()` is also idempotent, and the later `dispose()` call remains required to finish asynchronous cleanup.
 
 ```ts
