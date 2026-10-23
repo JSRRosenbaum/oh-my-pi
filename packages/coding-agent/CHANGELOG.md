@@ -4,16 +4,16 @@
 
 ### Added
 
-- Added awaited extension turn-end contributions and continuation, native turn outcomes, and `agent_settled` for consumers that need the owning prompt's final idle boundary.
-- Added session-scoped remote dialog hosts with local/remote first-answer arbitration, cancellation and typed native plan-mode controls.
-- Emit reasoned extension session lifecycle events for native new, resume, fork (including entry branching), startup, reload, and quit transitions, while preserving the existing switch and branch events.
+- Added awaited extension turn-end contributions and continuation, native turn outcomes, and `agent_settled` for consumers that need the owning prompt's final idle boundary ([#1](https://github.com/JSRRosenbaum/oh-my-pi/pull/1) by [@JSRRosenbaum](https://github.com/JSRRosenbaum)).
+- Added session-scoped remote dialog hosts with local/remote first-answer arbitration, cancellation and typed native plan-mode controls ([#1](https://github.com/JSRRosenbaum/oh-my-pi/pull/1) by [@JSRRosenbaum](https://github.com/JSRRosenbaum)).
+- Emit reasoned extension session lifecycle events for native new, resume, fork (including entry branching), startup, reload, and quit transitions, while preserving the existing switch and branch events ([#1](https://github.com/JSRRosenbaum/oh-my-pi/pull/1) by [@JSRRosenbaum](https://github.com/JSRRosenbaum)).
 
 
 ### Fixed
 
-- Clear extension-owned timers across replacement sessions, emit the missing `/btw` successor start, invalidate pending plan reviews on plan-mode exit, and renew extension dialog lifetimes on restart.
-- Keep accepted turn contributions durable exactly once across cancellation; do not call the provider again after an interrupted tool batch.
-- Notify extension consumers when started compaction fails or is cancelled, including post-append bookkeeping failures, and expose user-dialog wait spans without forwarding privileged consent.
+- Clear extension-owned timers across replacement sessions, emit the missing `/btw` successor start, invalidate pending plan reviews on plan-mode exit, and renew extension dialog lifetimes on restart ([#1](https://github.com/JSRRosenbaum/oh-my-pi/pull/1) by [@JSRRosenbaum](https://github.com/JSRRosenbaum)).
+- Keep accepted turn contributions durable exactly once across cancellation; do not call the provider again after an interrupted tool batch ([#1](https://github.com/JSRRosenbaum/oh-my-pi/pull/1) by [@JSRRosenbaum](https://github.com/JSRRosenbaum)).
+- Notify extension consumers when started compaction fails or is cancelled, including post-append bookkeeping failures, and expose user-dialog wait spans without forwarding privileged consent ([#1](https://github.com/JSRRosenbaum/oh-my-pi/pull/1) by [@JSRRosenbaum](https://github.com/JSRRosenbaum)).
 
 ## [18.12.6] - 2026-10-21
 

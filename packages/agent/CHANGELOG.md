@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Preserved terminal `agent_end` publication when an awaited turn-end callback also rejects during error or cancellation, keeping subsequent requests usable.
+- Preserved terminal `agent_end` publication when an awaited turn-end callback also rejects during error or cancellation, keeping subsequent requests usable ([#1](https://github.com/JSRRosenbaum/oh-my-pi/pull/1) by [@JSRRosenbaum](https://github.com/JSRRosenbaum)).
 
 ## [18.12.4] - 2026-10-20
 

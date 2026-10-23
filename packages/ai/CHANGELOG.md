@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed Codex requiring fabricated optional tool arguments, which prevented text-only Telegram messages and other extension calls from completing.
+- Fixed Codex requiring fabricated optional tool arguments, which prevented text-only Telegram messages and other extension calls from completing ([#1](https://github.com/JSRRosenbaum/oh-my-pi/pull/1) by [@JSRRosenbaum](https://github.com/JSRRosenbaum)).
 
 ## [18.12.5] - 2026-10-21
 
