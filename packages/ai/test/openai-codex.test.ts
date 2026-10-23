@@ -62,6 +62,7 @@ describe("openai-codex tool schemas", () => {
 			type: "function",
 			name: "list_outgoing_messages",
 			description: "List outgoing messages",
+			strict: false,
 			parameters: { type: "object", properties: {} },
 		});
 	});
@@ -86,6 +87,7 @@ describe("openai-codex tool schemas", () => {
 			type: "function",
 			name: "get_design_context",
 			description: "Get Figma design context",
+			strict: false,
 			parameters: {
 				type: "object",
 				properties: {
@@ -117,6 +119,7 @@ describe("openai-codex tool schemas", () => {
 			type: "function",
 			name: "read_dynamic_values",
 			description: "Read dynamic values",
+			strict: false,
 			parameters: {
 				type: "object",
 				patternProperties: {
@@ -154,26 +157,30 @@ describe("openai-codex tool schemas", () => {
 		expect(converted[0]).toMatchObject({ type: "function", name: "search", strict: false });
 	});
 
-	it("omits strict when the tool leaves it unset (#4336)", () => {
-		const tools: Tool[] = [
-			{
-				name: "search",
-				description: "Search",
-				parameters: {
-					type: "object",
-					additionalProperties: false,
-					properties: { name: { type: "string" } },
-					required: ["name"],
+	it("keeps optional media omittable instead of letting Responses require a fabricated upload", () => {
+		const converted = convertOpenAICodexResponsesTools(
+			[
+				{
+					name: "telegram_message",
+					description: "Send text with an optional local media upload",
+					parameters: {
+						type: "object",
+						properties: {
+							text: { type: "string" },
+							media: { type: "string", minLength: 1 },
+						},
+						required: ["text"],
+					},
 				},
-			},
-		];
-
-		const converted = convertOpenAICodexResponsesTools(tools, createCodexModel("gpt-5.5"));
-		const payload = converted[0] as { strict?: boolean };
-
-		// Codex responses only enforces strict when the tool opts in; leaving
-		// `strict` unset MUST NOT synthesize the field either way.
-		expect(payload.strict).toBeUndefined();
+			],
+			createCodexModel("gpt-5.5"),
+		);
+		// An absent flag makes Responses normalize every property to required.
+		// Explicit non-strict preserves omission; no null/dummy upload is needed.
+		expect(converted[0]).toMatchObject({
+			strict: false,
+			parameters: { required: ["text"], properties: { media: { type: "string", minLength: 1 } } },
+		});
 	});
 });
 
