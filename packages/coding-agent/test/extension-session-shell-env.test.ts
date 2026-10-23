@@ -101,7 +101,7 @@ describe("session lifecycle environment reaches bash commands", () => {
 		const sessionManager = SessionManager.inMemory(tempDir.path());
 		const runner = await createRunner(sessionManager);
 
-		await runner.emit({ type: "session_start" });
+		await runner.emit({ type: "session_start", reason: "startup" });
 
 		const sessionId = sessionManager.getSessionId();
 		expect(await run(`printf '%s' "$${ENV_KEY}"`, sessionId)).toBe(sessionId);
@@ -110,7 +110,7 @@ describe("session lifecycle environment reaches bash commands", () => {
 	it("after a session switch, commands see the new session's value, not the previous one", async () => {
 		const sessionManager = SessionManager.inMemory(tempDir.path());
 		const runner = await createRunner(sessionManager);
-		await runner.emit({ type: "session_start" });
+		await runner.emit({ type: "session_start", reason: "startup" });
 		const firstId = sessionManager.getSessionId();
 		expect(await run(`printf '%s' "$${ENV_KEY}"`, firstId)).toBe(firstId);
 
@@ -125,12 +125,12 @@ describe("session lifecycle environment reaches bash commands", () => {
 	it("a session event that leaves the environment unchanged keeps the persistent shell and its state", async () => {
 		const sessionManager = SessionManager.inMemory(tempDir.path());
 		const runner = await createRunner(sessionManager);
-		await runner.emit({ type: "session_start" });
+		await runner.emit({ type: "session_start", reason: "startup" });
 		const sessionKey = sessionManager.getSessionId();
 		await run("export PI_TEST_PERSISTENT_MARK=kept", sessionKey);
 
 		// Same session, same exported value: the rebuilt environment is identical.
-		await runner.emit({ type: "session_start" });
+		await runner.emit({ type: "session_start", reason: "startup" });
 
 		expect(await run(`printf '%s' "$PI_TEST_PERSISTENT_MARK"`, sessionKey)).toBe("kept");
 	});
@@ -138,7 +138,7 @@ describe("session lifecycle environment reaches bash commands", () => {
 	it("a subagent's session start leaves the parent's commands with the parent's value", async () => {
 		const parentSession = SessionManager.inMemory(tempDir.path());
 		const parent = await createRunner(parentSession);
-		await parent.emit({ type: "session_start" });
+		await parent.emit({ type: "session_start", reason: "startup" });
 		const parentId = parentSession.getSessionId();
 
 		// An in-process subagent: its own runner and session, the same process.env.
@@ -146,7 +146,7 @@ describe("session lifecycle environment reaches bash commands", () => {
 		// subagent's own command is the first to need it.
 		const childSession = SessionManager.inMemory(tempDir.path());
 		const child = await createRunner(childSession, SUBAGENT);
-		await child.emit({ type: "session_start" });
+		await child.emit({ type: "session_start", reason: "startup" });
 		await run("true", childSession.getSessionId());
 
 		expect(await run(`printf '%s' "$${ENV_KEY}"`, parentId)).toBe(parentId);

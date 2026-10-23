@@ -120,7 +120,7 @@ describe("startup-deferred extensions", () => {
 		try {
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected an extension runner");
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 			expect(session.getAllToolNames()).not.toContain("deferred_probe");
 
 			await session.loadDeferredExtensions();

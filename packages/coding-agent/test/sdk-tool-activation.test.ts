@@ -508,7 +508,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.getActiveToolNames()).not.toContain("write");
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected extension runner");
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 
 			expect(session.getActiveToolNames()).toContain("write");
 			expect(session.getActiveToolNames()).not.toContain("late_device_tool");
@@ -550,7 +550,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		try {
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected extension runner");
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 
 			expect(session.getAllToolNames()).toContain("late_requested_tool");
 			expect(session.getEnabledToolNames()).toContain("late_requested_tool");
@@ -589,7 +589,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.getEnabledToolNames()).toContain("bash");
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected extension runner");
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 
 			expect(session.getToolByName("bash")?.label).toBe("Late Inactive Bash");
 			expect(session.hasBuiltInTool("bash")).toBe(false);
@@ -634,7 +634,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		const runner = session.extensionRunner;
 		if (!runner) throw new Error("expected extension runner");
 		let emissionCompleted = false;
-		const emission = runner.emit({ type: "session_start" }).finally(() => {
+		const emission = runner.emit({ type: "session_start", reason: "startup" }).finally(() => {
 			emissionCompleted = true;
 		});
 
@@ -692,7 +692,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		try {
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected extension runner");
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 
 			expect(session.getToolByName("mcp__foo_bar_lookup")?.label).toBe("foo.bar/lookup");
 			await session.refreshMCPTools([
@@ -817,7 +817,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.getToolByName("mcp__foo_bar_refresh")?.label).toBe("foo.bar/refresh connected");
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected extension runner");
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 			expect(session.getToolByName("mcp__foo_bar_refresh")?.label).toBe("foo.bar/refresh reconnected");
 		} finally {
 			await session.dispose();
@@ -870,7 +870,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.getToolByName("shared_lifecycle_tool")?.label).toBe("Later Tool");
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected extension runner");
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 			expect(session.getToolByName("shared_lifecycle_tool")?.label).toBe("Later Tool");
 		} finally {
 			await session.dispose();
@@ -904,7 +904,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.getToolByName(sdkCustomTool.name)?.label).toBe(sdkCustomTool.label);
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected extension runner");
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 			expect(session.getToolByName(sdkCustomTool.name)?.label).toBe(sdkCustomTool.label);
 		} finally {
 			await session.dispose();
@@ -946,7 +946,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			await session.refreshRpcHostTools([rpcHostTool]);
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected extension runner");
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 			expect(session.getToolByName(rpcHostTool.name)?.label).toBe(rpcHostTool.label);
 		} finally {
 			await session.dispose();
@@ -997,7 +997,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		try {
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected extension runner");
-			const emission = runner.emit({ type: "session_start" });
+			const emission = runner.emit({ type: "session_start", reason: "startup" });
 			await activationEntered.promise;
 			const mcpRefresh = session.refreshMCPTools([mcpTool]);
 			await Promise.resolve();
@@ -1047,7 +1047,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		try {
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected extension runner");
-			const emission = runner.emit({ type: "session_start" });
+			const emission = runner.emit({ type: "session_start", reason: "startup" });
 			await activationEntered.promise;
 			const memoryRefresh = session.applyMemoryBackend();
 
@@ -1149,7 +1149,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.getMountedXdevToolNames()).toContain("late_becomes_essential");
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected extension runner");
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 
 			expect(session.getActiveToolNames()).not.toContain("late_becomes_discoverable");
 			expect(session.getMountedXdevToolNames()).toContain("late_becomes_discoverable");
@@ -1190,7 +1190,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.systemPrompt.join("\n")).toContain("Original prompt-visible lifecycle description.");
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected extension runner");
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 
 			const prompt = session.systemPrompt.join("\n");
 			expect(session.getToolByName("prompt_refresh_tool")?.label).toBe("Replacement Prompt Tool");
@@ -1248,7 +1248,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 				errors.push(error.error);
 			});
 			rejectReplacementPrompt = true;
-			emission = runner.emit({ type: "session_start" });
+			emission = runner.emit({ type: "session_start", reason: "startup" });
 			await replacementRefreshAttempted.promise;
 			expect(errors).not.toContain("expected replacement prompt failure");
 			releaseHandler.resolve();
@@ -1311,7 +1311,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			errors.push(error.error);
 		});
 		let emissionCompleted = false;
-		const emission = runner.emit({ type: "session_start" }).finally(() => {
+		const emission = runner.emit({ type: "session_start", reason: "startup" }).finally(() => {
 			emissionCompleted = true;
 		});
 
@@ -1379,7 +1379,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			});
 			testSetExtensionHandlerTimeoutMs(10);
 
-			await runner.emit({ type: "session_start" });
+			await runner.emit({ type: "session_start", reason: "startup" });
 			unsubscribe();
 
 			expect(errors).toContain("handler timed out after 10ms");

@@ -979,6 +979,7 @@ class TurnEndEvent:
     type: Literal["turn_end"] = "turn_end"
     message: AgentMessage
     tool_results: tuple[ToolResultMessage, ...]
+    outcome: Literal["completed", "aborted", "error"]
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -2298,6 +2299,7 @@ def parse_turn_end_event(value: object, path: str = "TurnEndEvent") -> TurnEndEv
     return TurnEndEvent(
         message=required(payload, "message", parse_agent_message, path),
         tool_results=required(payload, "toolResults", array(parse_tool_result_message), path),
+        outcome=required(payload, "outcome", cast('Decoder[Literal["completed", "aborted", "error"]]', literal(frozenset({"completed", "aborted", "error"}))), path),
     )
 
 

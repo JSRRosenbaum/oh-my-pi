@@ -286,6 +286,10 @@ Also exposed:
 - `pi.typebox` (legacy TypeBox-compatible shim)
 - `pi.pi` (package exports)
 
+Legacy Pi `SettingsManager.create(cwd)` remains synchronous and resolves the active extension session's settings, not another session's singleton. Its `getEnabledModels()` and `setEnabledModels(patterns)` accessors use the native typed `enabledModels` handle; passing `undefined` removes the global selection, and `flush()` persists the change. The removed generic string-path settings API is not restored.
+
+Handler contexts preserve own enumerable fields such as `sessionManager` while retaining live `model` and `annotations` getters. Pi consumers may clone the context for a status view without losing session access; an explicit value spread still snapshots getters at the consumer's chosen point. Handler-scoped UI cancellation remains in effect.
+
 ### Runtime setting overrides
 
 Settings are addressed through typed registry handles (see "Definitions" in [config-usage.md](./config-usage.md#definitions-srcconfigregistryts)); the string-path `settings.get`/`set`/`override` methods were removed in 18.3. Extensions resolve a handle by id with `lookup(id)` (and enumerate them with `all()`) from the `@oh-my-pi/pi-coding-agent/config/registry` subpath, then pass `pi.pi.settings` as the scope:
@@ -485,6 +489,19 @@ Cancelable pre-events:
 - `session_before_tree` → `{ cancel?: boolean; summary?: { summary: string; details?: unknown } }`
 
 `session_before_branch` and `session_branch` carry `reason`, which decides what `session_before_branch.entryId` means. For `"branch"` (`branch(entryId)`, `/branch`) it is the user message being rewound: it and everything after it are dropped. For `"fork"` (`AgentSession.fork(entryId)`, RPC `fork` with an `entryId`) and `"btw"` (`/btw` promotion) it is the last entry kept in the new session.
+
+Replacement sessions emit `session_shutdown` before the transition and
+`session_start` after the successor identity is active. A `session_tree` event
+expires remote-dialog registration without a following `session_start`; hosts
+handling that event must re-register separately.
+
+`/restart` emits `session_shutdown` with `reason: "restart"` before replacing
+the process image; ordinary exit uses `"quit"`. On POSIX, the replacement keeps
+the PID, so PID liveness alone cannot distinguish the old extension runtime
+from its successor. Extensions should settle any authenticated external
+registration handoff within the shutdown handler's existing two-second budget.
+The restarted process emits the normal `"startup"` event against the resumed
+session; an in-memory handoff does not survive process-image replacement.
 
 ### Prompt and turn lifecycle
 

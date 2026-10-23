@@ -134,6 +134,9 @@ export function extensionEventFromSessionEvent(
 				turnIndex,
 				message: event.message,
 				toolResults: event.toolResults,
+				outcome: event.outcome,
+				entries: [],
+				continue: false,
 			};
 		case "message_start":
 			return { type: "message_start", message: event.message };

@@ -68,11 +68,24 @@ export type CommittableAsideMessage = AgentMessage & {
  */
 export type AsideMessage = CommittableAsideMessage | (() => CommittableAsideMessage | null);
 
+/** Model-step contributions returned by an awaited turn-end callback. */
+export interface AgentTurnEndResult {
+	/** Native model-visible messages to persist after this turn and include in its next request. */
+	messages?: AgentMessage[];
+	/** Await native persistence after message-end events have entered the host pipeline. */
+	onMessagesCommitted?: (messages: AgentMessage[]) => Promise<void> | void;
+	/** Continue exactly once from the contribution even when the assistant response was otherwise final. */
+	continue?: boolean;
+}
+export type AgentTurnOutcome = "completed" | "aborted" | "error";
+
 export interface AgentTurnEndContext {
 	/** Assistant/user message that just completed this turn boundary. */
 	message: AgentMessage;
 	/** Tool results produced by this turn, already paired with `message` in the live context. */
 	toolResults: ToolResultMessage[];
+	/** Faithful result of the model step that ended this turn. */
+	outcome: AgentTurnOutcome;
 	/**
 	 * Passive model-visible messages appended after the tool results at this
 	 * boundary. The agent loop always sends an array (possibly empty);
@@ -601,7 +614,11 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * is true when the current tool-loop batch is continuing without yielding to
 	 * post-turn steering.
 	 */
-	onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void;
+	onTurnEnd?: (
+		messages: AgentMessage[],
+		signal?: AbortSignal,
+		context?: AgentTurnEndContext,
+	) => Promise<AgentTurnEndResult | void> | AgentTurnEndResult | void;
 
 	/**
 	 * Called once an assistant message is finalized from the model stream, before
@@ -1280,7 +1297,7 @@ export type AgentEvent =
 	  }
 	// Turn lifecycle - a turn is one assistant response + any tool calls/results
 	| { type: "turn_start" }
-	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }
+	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[]; outcome: AgentTurnOutcome }
 	// Message lifecycle - emitted for user, assistant, and toolResult messages
 	| { type: "message_start"; message: AgentMessage }
 	// Only emitted for assistant messages during streaming

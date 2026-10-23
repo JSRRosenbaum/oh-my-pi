@@ -1,8 +1,15 @@
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { ExtensionUIContext } from "./types";
 
-/** Runs a dialog that waits for the user's answer, so its session can treat the time as the user's, not the agent's. */
-export type UserWaitTracker = <T>(dialog: () => Promise<T>) => Promise<T>;
+/** Public dialog metadata; privileged approvals intentionally carry no title. */
+export interface UserWaitPrompt {
+	kind: "select" | "confirm" | "input" | "editor" | "custom";
+	title?: string;
+	timeout?: number;
+}
+
+/** Track UI lifecycle and distinguish timed dialogs from operator-owned computer waits. */
+export type UserWaitTracker = <T>(dialog: () => Promise<T>, prompt?: UserWaitPrompt) => Promise<T>;
 
 /** The {@link ExtensionUIContext} methods that wait for the user's answer. */
 const DIALOGS: Record<string, true> = {
@@ -18,9 +25,9 @@ const DIALOGS: Record<string, true> = {
 type Method = (...args: unknown[]) => unknown;
 
 /**
- * `ui` with each dialog run through `track`, unless its options give it a deadline (`ask.timeout`): such a dialog
- * settles on its own and the agent goes on, possibly with nobody at the machine, so its time stays the agent's. Every
- * other member passes through. Members are read from `ui` on every access, so one it replaces later is the one called.
+ * `ui` with each dialog run through `track`. Timed dialogs still publish their
+ * waiting span, but the tracker leaves their deadline-owned time with the agent.
+ * Other members pass through and replacement methods are read on every access.
  */
 export function trackUserWaits(ui: ExtensionUIContext, track: UserWaitTracker): ExtensionUIContext {
 	// Wrappers keep their identity while the member they wrap does.
@@ -32,10 +39,17 @@ export function trackUserWaits(ui: ExtensionUIContext, track: UserWaitTracker): 
 			const cached = methods.get(property);
 			if (cached?.value === value) return cached.method;
 			const method: Method = Object.hasOwn(DIALOGS, property)
-				? (...args) =>
-						args.some(arg => isRecord(arg) && typeof arg.timeout === "number" && arg.timeout > 0)
-							? value.apply(target, args)
-							: track(() => value.apply(target, args))
+				? (...args) => {
+						const kind =
+							property === "select" || property === "confirm" || property === "input" || property === "editor"
+								? property
+								: "custom";
+						const options = args.find(arg => isRecord(arg) && typeof arg.timeout === "number");
+						const timeout =
+							isRecord(options) && typeof options.timeout === "number" ? options.timeout : undefined;
+						const title = kind !== "custom" && typeof args[0] === "string" ? args[0] : undefined;
+						return track(() => value.apply(target, args), { kind, title, timeout });
+					}
 				: value.bind(target);
 			methods.set(property, { value: value as Method, method });
 			return method;

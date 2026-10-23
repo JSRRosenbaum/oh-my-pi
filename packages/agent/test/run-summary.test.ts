@@ -203,6 +203,70 @@ describe("AgentRunSummary delivery", () => {
 		expect(endEvent?.coverage).toBeUndefined();
 	});
 });
+describe("awaited turn-end contributions", () => {
+	it("includes a completed final-step contribution in exactly one following model request", async () => {
+		const mock = createMockModel({ responses: [{ content: ["first"] }, { content: ["second"] }] });
+		const contribution = createUserMessage("continue the Telegram task");
+		const outcomes: string[] = [];
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			{ systemPrompt: ["sys"], messages: [], tools: [] },
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				onTurnEnd: (_messages, _signal, context) => {
+					outcomes.push(context!.outcome);
+					return outcomes.length === 1 ? { messages: [contribution], continue: true } : undefined;
+				},
+			},
+			undefined,
+			mock.stream,
+		);
+		for await (const event of stream) events.push(event);
+
+		expect(outcomes).toEqual(["completed", "completed"]);
+		expect(mock.calls).toHaveLength(2);
+		expect(mock.calls[1].context.messages).toContain(contribution);
+		expect(events.filter(event => event.type === "turn_end").map(event => event.outcome)).toEqual([
+			"completed",
+			"completed",
+		]);
+	});
+	it("delivers a completed tool-turn contribution after the tool result and into the next request", async () => {
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "held-1", name: "alpha", arguments: { value: "x" } }] },
+				{ content: ["done"] },
+			],
+		});
+		const contribution = createUserMessage("apply the incoming steer");
+		const tool = buildTool({ name: "alpha", behavior: "ok", result: "tool completed" });
+		let toolResultsAtBoundary = 0;
+		const stream = agentLoop(
+			[createUserMessage("run tool")],
+			{ systemPrompt: ["sys"], messages: [], tools: [tool] },
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				onTurnEnd: (_messages, _signal, context) => {
+					if (context!.toolResults.length > 0) {
+						toolResultsAtBoundary = context!.toolResults.length;
+						return { messages: [contribution], continue: true };
+					}
+					return undefined;
+				},
+			},
+			undefined,
+			mock.stream,
+		);
+		await stream.result();
+
+		expect(toolResultsAtBoundary).toBe(1);
+		expect(mock.calls).toHaveLength(2);
+		expect(mock.calls[1].context.messages).toContain(contribution);
+	});
+});
 
 describe("AgentRunSummary aggregation", () => {
 	it("sums token + cost totals across multiple chats and counts stop_reasons", async () => {

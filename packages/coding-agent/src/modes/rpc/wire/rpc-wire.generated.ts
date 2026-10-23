@@ -801,6 +801,7 @@ export interface TurnEndEvent {
 	type: "turn_end";
 	message: AgentMessage;
 	toolResults: ToolResultMessage[];
+	outcome: "completed" | "aborted" | "error";
 }
 
 export interface MessageStartEvent {

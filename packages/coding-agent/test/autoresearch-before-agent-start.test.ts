@@ -102,7 +102,7 @@ describe("autoresearch before_agent_start handler", () => {
 		}
 
 		const ctx = makeCtx(cwdDir.path());
-		await handlers.session_start({ type: "session_start" } as SessionStartEvent, ctx);
+		await handlers.session_start({ type: "session_start", reason: "startup" } as SessionStartEvent, ctx);
 
 		// Crash repro: upstream leaves event.systemPrompt unset; handler must
 		// not throw, and the rendered block must still contain the autoresearch
@@ -129,7 +129,7 @@ describe("autoresearch before_agent_start handler", () => {
 		}
 
 		const ctx = makeCtx(cwdDir.path());
-		await handlers.session_start({ type: "session_start" } as SessionStartEvent, ctx);
+		await handlers.session_start({ type: "session_start", reason: "startup" } as SessionStartEvent, ctx);
 
 		const event: BeforeAgentStartEvent = {
 			type: "before_agent_start",

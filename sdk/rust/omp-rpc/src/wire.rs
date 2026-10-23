@@ -3636,6 +3636,7 @@ pub struct TurnEndEvent {
 	pub message: AgentMessage,
 	#[serde(rename = "toolResults")]
 	pub tool_results: Vec<ToolResultMessage>,
+	pub outcome: TurnEndEventOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5732,6 +5733,27 @@ impl LogoutAccountType {
 		match self {
 			Self::ApiKey => "api_key",
 			Self::Oauth => "oauth",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TurnEndEventOutcome {
+	#[serde(rename = "completed")]
+	Completed,
+	#[serde(rename = "aborted")]
+	Aborted,
+	#[serde(rename = "error")]
+	Error,
+}
+
+impl TurnEndEventOutcome {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Completed => "completed",
+			Self::Aborted => "aborted",
+			Self::Error => "error",
 		}
 	}
 }

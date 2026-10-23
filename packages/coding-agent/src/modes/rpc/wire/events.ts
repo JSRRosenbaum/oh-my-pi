@@ -39,7 +39,12 @@ export const eventDefs = {
 		"coverage?": JSON_OBJECT,
 	},
 	TurnStartEvent: { type: "'turn_start'" },
-	TurnEndEvent: { type: "'turn_end'", message: "AgentMessage", toolResults: "ToolResultMessage[]" },
+	TurnEndEvent: {
+		type: "'turn_end'",
+		message: "AgentMessage",
+		toolResults: "ToolResultMessage[]",
+		outcome: "'completed' | 'aborted' | 'error'",
+	},
 	MessageStartEvent: { type: "'message_start'", message: "AgentMessage", "messageId?": MESSAGE_ID },
 	MessageUpdateEvent: {
 		type: "'message_update'",

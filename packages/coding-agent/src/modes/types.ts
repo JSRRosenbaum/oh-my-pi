@@ -6,6 +6,7 @@ import type { TspText } from "@oh-my-pi/pi-wire";
 import type { StatusNotice } from "@oh-my-pi/pi-tui/chrome/status-notice";
 import type { CollabController } from "../collab/controller";
 import type { CollabGuestLink } from "../collab/guest";
+import type { RemoteDialogHosts } from "./remote-dialogs";
 import type { CollabHost } from "../collab/host";
 import type { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import type { TrackSegment } from "@oh-my-pi/pi-tui/chrome/segment-track";
@@ -191,6 +192,8 @@ export interface InteractiveModeContext {
 	collabController: CollabController;
 	/** Owned room; use {@link collabController}.host for current-session reuse and links. */
 	collabHost?: CollabHost;
+	/** Eligible user-facing dialog surfaces, scoped to this interactive session. */
+	remoteDialogHosts: RemoteDialogHosts;
 	collabGuest?: CollabGuestLink;
 	eventController: EventController;
 	eventBus?: EventBus;
@@ -224,6 +227,8 @@ export interface InteractiveModeContext {
 	loopLimit?: LoopLimitRuntime;
 	loopCondition?: LoopConditionConfig;
 	planModePlanFilePath?: string;
+	getPlanMode(): "active" | "paused" | "off";
+	setPlanMode(action: "enter" | "pause" | "exit", options?: { confirmed?: boolean }): Promise<boolean>;
 	hideThinkingBlock: boolean;
 	/**
 	 * Effective thinking-block visibility: true when hidden by user setting OR

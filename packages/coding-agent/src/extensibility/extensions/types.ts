@@ -80,6 +80,7 @@ import type { BashResult } from "../../exec/bash-executor";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type * as PiCodingAgent from "../../index";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
+import type { RemoteDialogHost } from "../../modes/remote-dialogs";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
@@ -99,6 +100,7 @@ import type { FileDeleteFallbackHandler, FileWriteFallbackHandler } from "../../
 import type { EventBus } from "../../utils/event-bus";
 import type {
 	AgentEndEvent,
+	AgentSettledEvent,
 	AgentStartEvent,
 	AutoCompactionEndEvent,
 	AutoCompactionStartEvent,
@@ -134,6 +136,11 @@ import type {
 	ToolResultEventResult,
 	TtsrTriggeredEvent,
 	TurnEndEvent,
+	SessionCompactFailedEvent,
+	ModelSelectEvent,
+	UIPromptEndEvent,
+	UIPromptStartEvent,
+	TurnEndEventResult,
 	TurnStartEvent,
 } from "../shared-events";
 import type { SlashCommandInfo } from "../slash-commands";
@@ -300,6 +307,12 @@ export type ExtensionApprovalAnswer =
 // and may be invoked from event handlers that have already taken the agent
 // loop's lock — hooks intentionally cannot.
 export interface ExtensionUIContext {
+	/**
+	 * Register a remote surface for ordinary extension dialogs in this native
+	 * session. Unsupported modes omit this capability. Disposal/session
+	 * replacement aborts pending requests; privileged approvals remain local.
+	 */
+	registerRemoteDialogHost?(host: RemoteDialogHost): () => void;
 	/** True when selector timeouts start only after the dialog is presented. */
 	timeoutStartsOnPresentation?: boolean;
 	/** True when pasteToEditor updates a local or remote composer; absent means unsupported. */
@@ -728,6 +741,10 @@ export interface ExtensionContext {
 	 * plan file exists.
 	 */
 	openPlanReview(): Promise<boolean>;
+	/** Read native interactive plan mode; absent outside supporting modes. */
+	getPlanMode?(): "active" | "paused" | "off";
+	/** Apply an explicit native plan action. Pause/exit with a draft require producer-owned confirmation. */
+	setPlanMode?(action: "enter" | "pause" | "exit", options?: { confirmed?: boolean }): Promise<boolean>;
 	/** Identity of the agent this session runs: the top-level session or a subagent. */
 	agent: ExtensionAgentIdentity;
 	/**
@@ -1087,11 +1104,22 @@ export interface BeforeSubagentSpawnEvent {
 
 export type {
 	AgentEndEvent,
+	AgentSettledEvent,
 	AgentStartEvent,
+	ModelSelectEvent,
+	ModelSelectSource,
+	SessionCompactFailedEvent,
 	SessionStopEvent,
 	SessionStopEventResult,
+	TurnEndEntry,
 	TurnEndEvent,
+	TurnEndEventResult,
+	TurnEndCustomEntryDraft,
+	TurnEndCustomMessageEntryDraft,
 	TurnStartEvent,
+	UIPromptEndEvent,
+	UIPromptKind,
+	UIPromptStartEvent,
 } from "../shared-events";
 
 /** Fired when a message starts (user, assistant, or toolResult) */
@@ -1469,6 +1497,7 @@ export function isToolCallEventType(toolName: string, event: ToolCallEvent): boo
 export type ExtensionEvent =
 	| ResourcesDiscoverEvent
 	| SessionEvent
+	| SessionCompactFailedEvent
 	| ContextEvent
 	| CacheWarmingDecisionEvent
 	| BeforeProviderRequestEvent
@@ -1477,9 +1506,13 @@ export type ExtensionEvent =
 	| BeforeSubagentSpawnEvent
 	| AgentStartEvent
 	| AgentEndEvent
+	| AgentSettledEvent
 	| SessionStopEvent
 	| TurnStartEvent
 	| TurnEndEvent
+	| ModelSelectEvent
+	| UIPromptStartEvent
+	| UIPromptEndEvent
 	| MessageStartEvent
 	| MessageUpdateEvent
 	| MessageEndEvent
@@ -1670,6 +1703,7 @@ export interface ExtensionAPI {
 	on(event: "session_shutdown", handler: ExtensionHandler<SessionShutdownEvent>): void;
 	on(event: "session_before_tree", handler: ExtensionHandler<SessionBeforeTreeEvent, SessionBeforeTreeResult>): void;
 	on(event: "session_tree", handler: ExtensionHandler<SessionTreeEvent>): void;
+	on(event: "session_compact_failed", handler: ExtensionHandler<SessionCompactFailedEvent>): void;
 	on(event: "context", handler: ExtensionHandler<ContextEvent, ContextEventResult>): void;
 	on(
 		event: "before_provider_request",
@@ -1683,9 +1717,10 @@ export interface ExtensionAPI {
 	): void;
 	on(event: "agent_start", handler: ExtensionHandler<AgentStartEvent>): void;
 	on(event: "agent_end", handler: ExtensionHandler<AgentEndEvent>): void;
+	on(event: "agent_settled", handler: ExtensionHandler<AgentSettledEvent>): void;
 	on(event: "session_stop", handler: ExtensionHandler<SessionStopEvent, SessionStopEventResult>): void;
 	on(event: "turn_start", handler: ExtensionHandler<TurnStartEvent>): void;
-	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent>): void;
+	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent, TurnEndEventResult>): void;
 	on(event: "message_start", handler: ExtensionHandler<MessageStartEvent>): void;
 	on(event: "message_update", handler: ExtensionHandler<MessageUpdateEvent>): void;
 	on(event: "message_end", handler: ExtensionHandler<MessageEndEvent>): void;
@@ -1696,6 +1731,9 @@ export interface ExtensionAPI {
 	on(event: "tool_execution_start", handler: ExtensionHandler<ToolExecutionStartEvent>): void;
 	on(event: "tool_execution_update", handler: ExtensionHandler<ToolExecutionUpdateEvent>): void;
 	on(event: "tool_execution_end", handler: ExtensionHandler<ToolExecutionEndEvent>): void;
+	on(event: "model_select", handler: ExtensionHandler<ModelSelectEvent>): void;
+	on(event: "ui_prompt_start", handler: ExtensionHandler<UIPromptStartEvent>): void;
+	on(event: "ui_prompt_end", handler: ExtensionHandler<UIPromptEndEvent>): void;
 	on(event: "auto_compaction_start", handler: ExtensionHandler<AutoCompactionStartEvent>): void;
 	on(event: "auto_compaction_end", handler: ExtensionHandler<AutoCompactionEndEvent>): void;
 	on(event: "auto_retry_start", handler: ExtensionHandler<AutoRetryStartEvent>): void;
@@ -2172,6 +2210,8 @@ export interface ExtensionContextActions {
 	) => boolean;
 	getPendingPlanReview?: () => PlanReviewRequestedEvent | undefined;
 	openPlanReview?: () => Promise<boolean>;
+	getPlanMode?: () => "active" | "paused" | "off";
+	setPlanMode?: (action: "enter" | "pause" | "exit", options?: { confirmed?: boolean }) => Promise<boolean>;
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];

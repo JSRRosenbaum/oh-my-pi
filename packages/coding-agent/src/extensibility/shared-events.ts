@@ -12,9 +12,14 @@
  * carry subsystem-specific message types — lives in the per-subsystem
  * `types.ts` files and is documented there.
  */
-import { type AgentMessage, isNonBlankContext, joinAdditionalContext } from "@oh-my-pi/pi-agent-core";
+import {
+	type AgentMessage,
+	type AgentTurnOutcome,
+	isNonBlankContext,
+	joinAdditionalContext,
+} from "@oh-my-pi/pi-agent-core";
 import type { CompactionPreparation, CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
-import type { AssistantRetryRecovery, ImageContent, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantRetryRecovery, ImageContent, Model, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type { Rule } from "../capability/rule";
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
 import type { GoalModeState } from "../goals/state";
@@ -26,9 +31,12 @@ import type { TodoItem } from "@oh-my-pi/pi-tui/tools/todo";
 // Session Events
 // ============================================================================
 
-/** Fired on initial session load */
+/** Why a session context started; `"startup"` is reserved for initial process setup. */
 export interface SessionStartEvent {
 	type: "session_start";
+	reason: "startup" | "reload" | "new" | "resume" | "fork";
+	/** Session file from the context that was replaced, when available. */
+	previousSessionFile?: string;
 }
 
 /** Fired before switching to another session (can be cancelled) */
@@ -100,10 +108,22 @@ export interface SessionCompactEvent {
 	/** Whether the compaction entry was provided by an extension/hook */
 	fromExtension: boolean;
 }
+/** Fired when compaction fails or aborts. */
+export interface SessionCompactFailedEvent {
+	type: "session_compact_failed";
+	reason: "manual" | "threshold" | "overflow" | "idle" | "incomplete";
+	errorMessage?: string;
+	aborted: boolean;
+	willRetry: boolean;
+	fromExtension: boolean;
+}
 
-/** Fired on process exit (SIGINT/SIGTERM) */
+/** Why the departing extension session is shutting down. */
 export interface SessionShutdownEvent {
 	type: "session_shutdown";
+	reason: "quit" | "restart" | "reload" | "new" | "resume" | "fork";
+	/** Destination session file for a replacement when one is known. */
+	targetSessionFile?: string;
 }
 
 /** Fired when a main-agent turn is about to settle; handlers may request one continuation turn. */
@@ -219,6 +239,10 @@ export interface AgentEndEvent {
 	 */
 	awaitingAsyncWork?: boolean;
 }
+/** Fired once after the owned agent run and all continuations have settled. */
+export interface AgentSettledEvent {
+	type: "agent_settled";
+}
 
 /** Fired at the start of each turn */
 export interface TurnStartEvent {
@@ -227,12 +251,57 @@ export interface TurnStartEvent {
 	timestamp: number;
 }
 
-/** Fired at the end of each turn */
+export interface TurnEndCustomEntryDraft {
+	type: "custom";
+	customType: string;
+	data?: unknown;
+}
+export interface TurnEndCustomMessageEntryDraft {
+	type: "custom_message";
+	customType: string;
+	content: string | (TextContent | ImageContent)[];
+	display: boolean;
+	details?: unknown;
+}
+/** Turn-end contributions supported by the native host; history rewrites use session maintenance APIs. */
+export type TurnEndEntry = TurnEndCustomEntryDraft | TurnEndCustomMessageEntryDraft;
+
+/** Results returned from an awaited turn-end handler. */
+export interface TurnEndEventResult {
+	entries?: TurnEndEntry[];
+	continue?: boolean;
+}
+
+/** Fired at the end of each turn with the native model-step outcome. */
 export interface TurnEndEvent {
 	type: "turn_end";
 	turnIndex: number;
 	message: AgentMessage;
 	toolResults: ToolResultMessage[];
+	outcome: AgentTurnOutcome;
+	entries: TurnEndEntry[];
+	continue: boolean;
+}
+export type ModelSelectSource = "set" | "cycle" | "restore";
+/** Fired when a new model is selected. */
+export interface ModelSelectEvent {
+	type: "model_select";
+	model: Model;
+	previousModel: Model | undefined;
+	source: ModelSelectSource;
+}
+
+export type UIPromptKind = "select" | "confirm" | "input" | "editor" | "custom";
+interface UIPromptEventData {
+	reason: "ui_prompt";
+	kind: UIPromptKind;
+	title?: string;
+}
+export interface UIPromptStartEvent extends UIPromptEventData {
+	type: "ui_prompt_start";
+}
+export interface UIPromptEndEvent extends UIPromptEventData {
+	type: "ui_prompt_end";
 }
 
 // ============================================================================

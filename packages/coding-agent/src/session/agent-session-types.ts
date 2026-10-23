@@ -36,6 +36,7 @@ import type { TtsrManager } from "../export/ttsr";
 import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { ExtensionRunner, PreparedExtension } from "../extensibility/extensions";
+import type { SessionShutdownEvent } from "../extensibility/shared-events";
 import type { CacheWarmer } from "./cache-warmer";
 import type { ContextUsage } from "../extensibility/extensions/types";
 import type { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
@@ -69,6 +70,8 @@ export interface AgentSessionDisposeOptions {
 	 * (`/quit`, test teardown, subagent completion).
 	 */
 	reason?: postmortem.Reason;
+	/** Extension lifecycle boundary; independent of the postmortem exit diagnostic. */
+	shutdownReason?: SessionShutdownEvent["reason"];
 }
 
 /** Listener notified when command metadata changes. */
@@ -490,6 +493,8 @@ export interface SendUserMessageOptions {
 	deliverAs?: "steer" | "followUp" | "aside";
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Expand prompt templates and route slash commands only when explicitly enabled. */
+	expandPromptTemplates?: boolean;
 }
 
 /** Result from a handoff operation. */

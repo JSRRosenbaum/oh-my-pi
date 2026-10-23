@@ -192,7 +192,7 @@ export default function (pi) {
 			surfaced.push(error.error);
 		});
 
-		await runner.emit({ type: "session_start" });
+		await runner.emit({ type: "session_start", reason: "startup" });
 
 		expect(surfaced).toEqual([]);
 		expect(fs.readFileSync(markerPath, "utf8")).toBe("initialized");

@@ -22,7 +22,9 @@ import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { cfgPlanEnabled } from "@oh-my-pi/pi-coding-agent/plan-mode/settings";
 import { createAssistantMessage, createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 
 describe("InteractiveMode plan mode exit", () => {
 	let tempDir: TempDir;
@@ -110,5 +112,50 @@ describe("InteractiveMode plan mode exit", () => {
 		expect(session.isStreaming).toBe(false);
 		expect(session.getPlanModeState()).toBeUndefined();
 		expect(abortReason).toBe(USER_INTERRUPT_LABEL);
+	});
+	it("refuses remote entry when plan mode is disabled or another protected mode is active", async () => {
+		cfgPlanEnabled.set(session.settings, false);
+		expect(await mode.setPlanMode("enter")).toBe(false);
+		expect(mode.getPlanMode()).toBe("off");
+
+		cfgPlanEnabled.set(session.settings, true);
+		mode.goalModeEnabled = true;
+		expect(await mode.setPlanMode("enter")).toBe(false);
+		expect(mode.getPlanMode()).toBe("off");
+		mode.goalModeEnabled = false;
+
+		mode.vibeModeEnabled = true;
+		expect(await mode.setPlanMode("enter")).toBe(false);
+		expect(mode.getPlanMode()).toBe("off");
+	});
+
+	it("exposes enter, pause, and exit through the native plan-mode lifecycle", async () => {
+		expect(mode.getPlanMode()).toBe("off");
+		expect(await mode.setPlanMode("enter")).toBe(true);
+		expect(mode.getPlanMode()).toBe("active");
+		expect(await mode.setPlanMode("pause")).toBe(true);
+		expect(mode.getPlanMode()).toBe("paused");
+		expect(await mode.setPlanMode("exit")).toBe(true);
+		expect(mode.getPlanMode()).toBe("off");
+	});
+
+	it("requires caller confirmation before pausing or exiting a non-empty plan draft", async () => {
+		await mode.setPlanMode("enter");
+		const planFilePath = mode.planModePlanFilePath ?? "local://PLAN.md";
+		const resolved = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolved, "# Draft plan\nDo not discard.");
+
+		expect(await mode.setPlanMode("pause")).toBe(false);
+		expect(mode.getPlanMode()).toBe("active");
+		expect(await mode.setPlanMode("pause", { confirmed: true })).toBe(true);
+		expect(mode.getPlanMode()).toBe("paused");
+		expect(await mode.setPlanMode("exit")).toBe(false);
+		expect(mode.getPlanMode()).toBe("paused");
+		expect(await mode.setPlanMode("exit", { confirmed: true })).toBe(true);
+		expect(mode.getPlanMode()).toBe("off");
+		expect(await Bun.file(resolved).text()).toContain("Do not discard.");
 	});
 });

@@ -46,7 +46,7 @@ export default function myExtension(pi: ExtensionAPI): void {
 
 | Event | Fires | Can return |
 |---|---|---|
-| `session_start` | On initial session load | — |
+| `session_start` | When a session context is ready: `startup`, `reload`, `new`, `resume`, or `fork`; replacement starts include the previous session file when known | — |
 | `session_before_switch` | Before session switch | `{ cancel?: boolean }` |
 | `session_switch` | After session switch | — |
 | `session_before_branch` | Before session branch | `{ cancel?: boolean; skipConversationRestore?: boolean }` |
@@ -56,7 +56,9 @@ export default function myExtension(pi: ExtensionAPI): void {
 | `session_compact` | After compaction | — |
 | `session_before_tree` | Before tree navigation | `{ cancel?: boolean; summary?: { summary: string; details?: unknown } }` |
 | `session_tree` | After tree navigation | — |
-| `session_shutdown` | On session shutdown | — |
+| `session_shutdown` | When a session context is replaced or the process quits: `new`, `resume`, `fork`, `reload`, or `quit`; replacement shutdowns include the target session file when known | — |
+
+Replacement lifecycle order is `session_shutdown` while the departing context is still live, the existing `session_switch` or `session_branch` event, then `session_start` for the ready successor. Cancellation before teardown emits none. If a transition fails after teardown and rolls back, the restored outgoing context receives `session_start` with reason `reload` so its stopped services restart; no successor is announced.
 
 ### Agent/turn lifecycle
 

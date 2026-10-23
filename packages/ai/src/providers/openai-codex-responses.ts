@@ -5188,7 +5188,9 @@ export function convertOpenAICodexResponsesTools(
 			name: tool.name,
 			description: tool.description || "",
 			parameters,
-			...(effectiveStrict ? { strict: true } : !NO_STRICT && tool.strict === false ? { strict: false } : {}),
+			// Responses otherwise normalizes an omitted flag to strict mode, making
+			// optional extension arguments required without nullable adaptation.
+			strict: effectiveStrict,
 		});
 	}
 	return payloads;

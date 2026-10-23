@@ -769,25 +769,43 @@ function buildAgentEndEvent(
 async function emitTurnEnd(
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	currentContext: AgentContext,
+	newMessages: AgentMessage[],
 	message: AgentMessage,
 	toolResults: ToolResultMessage[],
 	config: AgentLoopConfig,
 	signal?: AbortSignal,
-	context?: Omit<AgentTurnEndContext, "message" | "toolResults">,
-	runHookOnAbortedMessage = false,
-): Promise<void> {
-	stream.push({ type: "turn_end", message, toolResults });
+	context?: Omit<AgentTurnEndContext, "message" | "toolResults" | "outcome">,
+): Promise<boolean> {
 	const terminalYield = signal?.reason === TERMINAL_TOOL_RESULT_ABORT_REASON;
-	const isAbortedOrError =
-		message.role === "assistant" && (message.stopReason === "aborted" || message.stopReason === "error");
-	if ((signal?.aborted && !terminalYield) || (isAbortedOrError && !runHookOnAbortedMessage)) return;
-	await config.onTurnEnd?.(currentContext.messages, terminalYield ? undefined : signal, {
+	const outcome = terminalYield
+		? "completed"
+		: message.role === "assistant" && message.stopReason === "error"
+			? "error"
+			: message.role === "assistant" && message.stopReason === "aborted"
+				? "aborted"
+				: signal?.aborted
+					? "aborted"
+					: "completed";
+	stream.push({ type: "turn_end", message, toolResults, outcome });
+	const result = await config.onTurnEnd?.(currentContext.messages, terminalYield ? undefined : signal, {
 		message,
 		toolResults,
+		outcome,
 		additionalMessages: [],
 		willContinue: false,
 		...context,
 	});
+	if (outcome !== "completed" || !result) return false;
+	// Commit accepted contributions before another model request or observer can
+	// treat them as delivered. An abort during the hook must not erase custody.
+	await result.onMessagesCommitted?.(result.messages ?? []);
+	for (const contribution of result.messages ?? []) {
+		currentContext.messages.push(contribution);
+		newMessages.push(contribution);
+		stream.push({ type: "message_start", message: contribution });
+		stream.push({ type: "message_end", message: contribution });
+	}
+	return result.continue === true && (!signal?.aborted || terminalYield);
 }
 
 function createGateStopMessage(model: Model, reason: string | undefined): AssistantMessage {
@@ -1297,10 +1315,19 @@ async function runLoopBody(
 				stream,
 				executionResult.additionalContext,
 			);
-			await emitTurnEnd(stream, currentContext, resumeTail, executionResult.toolResults, config, signal, {
-				willContinue: !isDeadlineExceeded(config.deadline),
-				...(resumeContextMessage ? { additionalMessages: [resumeContextMessage] } : {}),
-			});
+			await emitTurnEnd(
+				stream,
+				currentContext,
+				newMessages,
+				resumeTail,
+				executionResult.toolResults,
+				config,
+				signal,
+				{
+					willContinue: !isDeadlineExceeded(config.deadline),
+					...(resumeContextMessage ? { additionalMessages: [resumeContextMessage] } : {}),
+				},
+			);
 			turnOpen = false;
 			// A tool hook may mark its completed result as terminal (e.g. subagent
 			// yield) — same stop-before-next-model-call rule as the main loop.
@@ -1388,8 +1415,25 @@ async function runLoopBody(
 					}
 					throw error;
 				}
-				if (config.beforeModelCall && signal?.aborted) {
-					gateResult = { stop: true };
+				if (signal?.aborted) {
+					if (!turnOpen) stream.push({ type: "turn_start" });
+					emitInputMessages(stream, turnMessages);
+					const abortedMessage = emitAbortedAssistantMessage(
+						null,
+						false,
+						new Set<string>(),
+						currentContext,
+						config,
+						stream,
+						signal,
+					);
+					newMessages.push(abortedMessage);
+					await emitTurnEnd(stream, currentContext, newMessages, abortedMessage, [], config, signal, {
+						willContinue: false,
+					});
+					turnOpen = false;
+					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+					return;
 				}
 				if (gateResult?.stop) {
 					if (gateResult.reason) {
@@ -1412,16 +1456,9 @@ async function runLoopBody(
 						newMessages.push(stopMessage);
 						stream.push({ type: "message_start", message: stopMessage });
 						stream.push({ type: "message_end", message: stopMessage });
-						await emitTurnEnd(
-							stream,
-							currentContext,
-							stopMessage,
-							[],
-							config,
-							signal,
-							{ willContinue: false },
-							true,
-						);
+						await emitTurnEnd(stream, currentContext, newMessages, stopMessage, [], config, signal, {
+							willContinue: false,
+						});
 						turnOpen = false;
 					}
 					preserveSoftRequirementState = !signal?.aborted;
@@ -1573,7 +1610,9 @@ async function runLoopBody(
 							status: message.stopReason === "aborted" ? "aborted" : "error",
 						});
 					}
-					await emitTurnEnd(stream, currentContext, message, toolResults, config, signal, { willContinue: false });
+					await emitTurnEnd(stream, currentContext, newMessages, message, toolResults, config, signal, {
+						willContinue: false,
+					});
 					turnOpen = false;
 
 					stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
@@ -1751,10 +1790,20 @@ async function runLoopBody(
 					hasMoreToolCalls = true;
 				}
 
-				await emitTurnEnd(stream, currentContext, message, toolResults, config, signal, {
-					additionalMessages,
-					willContinue: hasMoreToolCalls && !isDeadlineExceeded(config.deadline),
-				});
+				const turnEndContinues = await emitTurnEnd(
+					stream,
+					currentContext,
+					newMessages,
+					message,
+					toolResults,
+					config,
+					signal,
+					{
+						additionalMessages,
+						willContinue: hasMoreToolCalls && !isDeadlineExceeded(config.deadline),
+					},
+				);
+				if (turnEndContinues && !isDeadlineExceeded(config.deadline)) hasMoreToolCalls = true;
 				turnOpen = false;
 
 				if (isDeadlineExceeded(config.deadline)) {

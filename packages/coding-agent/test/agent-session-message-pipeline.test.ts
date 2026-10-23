@@ -128,7 +128,307 @@ describe("AgentSession message pipeline", () => {
 		sessions.push(session);
 		return session;
 	}
+	async function createTurnEndSession(
+		apiName: string,
+		factory: ExtensionFactory,
+		manager = SessionManager.inMemory(),
+		settings = Settings.isolated({ "compaction.enabled": false }),
+		initialMessages: AgentMessage[] = [],
+	) {
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			factory,
+			manager.getCwd(),
+			new EventBus(),
+			runtime,
+			`turn-end-${apiName}`,
+		);
+		let requests = 0;
+		const contexts: Context[] = [];
+		const errors: unknown[][] = [];
+		const signals: (AbortSignal | undefined)[] = [];
+		registerCustomApi(apiName, (_model, context, options) => {
+			requests++;
+			contexts.push(context);
+			signals.push(options?.signal);
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const answer = `answer ${requests}`;
+				const message = createAssistantMessage(answer);
+				stream.push({ type: "text_delta", contentIndex: 0, delta: answer, partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		});
+		const model = buildModel({
+			id: apiName,
+			name: apiName,
+			api: apiName,
+			provider: "turn-end-test",
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const modelRegistry = {
+			...createModelRegistryStub(),
+			getAvailable: () => [model],
+			fitContextWindow: (candidate: Model<Api>) => candidate,
+		} as unknown as ModelRegistry;
+		const runner = new ExtensionRunner([extension], runtime, manager.getCwd(), manager, modelRegistry);
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: { model, systemPrompt: ["test"], messages: initialMessages, tools: [] },
+				convertToLlm,
+			}),
+			sessionManager: manager,
+			settings,
+			extensionRunner: runner,
+			modelRegistry,
+		});
+		sessions.push(session);
+		await initializeExtensions(session, {
+			reportSendError: () => {},
+			reportRuntimeError: (...args: unknown[]) => {
+				errors.push(args);
+			},
+		});
+		return { session, manager, requests: () => requests, contexts, signals, errors };
+	}
+	function compactableManager(): SessionManager {
+		const manager = SessionManager.inMemory();
+		for (let index = 0; index < 8; index++) {
+			manager.appendMessage({
+				role: "user",
+				content: `earlier request ${index} ${"history ".repeat(80)}`,
+				timestamp: index * 2 + 1,
+			});
+			manager.appendMessage(createAssistantMessage(`earlier response ${index} ${"response ".repeat(80)}`));
+		}
+		return manager;
+	}
 
+	it("holds turn contributions and continuation until session storage confirms flush", async () => {
+		let turnEnd = 0;
+		const { session, manager, requests, contexts } = await createTurnEndSession("test-turn-end-flush-gate", api => {
+			api.on("turn_end", () => {
+				turnEnd++;
+				return turnEnd === 1
+					? {
+							entries: [
+								{
+									type: "custom_message",
+									customType: "flush-gate",
+									content: "durable contribution",
+									display: false,
+								},
+							],
+							continue: true,
+						}
+					: undefined;
+			});
+		});
+		const flushStarted = Promise.withResolvers<void>();
+		const releaseFlush = Promise.withResolvers<void>();
+		const flush = manager.flush.bind(manager);
+		vi.spyOn(manager, "flush").mockImplementation(async () => {
+			flushStarted.resolve();
+			await releaseFlush.promise;
+			await flush();
+		});
+		const contributions: AgentMessage[] = [];
+		session.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "custom") contributions.push(event.message);
+		});
+
+		const prompt = session.sendUserMessage("question");
+		await flushStarted.promise;
+		expect(requests()).toBe(1);
+		expect(contributions).toHaveLength(0);
+		releaseFlush.resolve();
+		await prompt;
+
+		expect(requests()).toBe(2);
+		expect(contributions).toHaveLength(1);
+		expect(JSON.stringify(contexts[1]?.messages)).toContain("durable contribution");
+	});
+
+	it("rejects turn contributions and continuation when session storage flush fails", async () => {
+		const { session, manager, requests } = await createTurnEndSession("test-turn-end-flush-failure", api => {
+			api.on("turn_end", () => ({
+				entries: [
+					{
+						type: "custom_message",
+						customType: "flush-failure",
+						content: "must not be accepted",
+						display: false,
+					},
+				],
+				continue: true,
+			}));
+		});
+		let terminalMessage: AgentMessage | undefined;
+		const contributions: AgentMessage[] = [];
+		session.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "custom") contributions.push(event.message);
+			if (event.type === "agent_end") terminalMessage = event.messages.at(-1);
+		});
+		vi.spyOn(manager, "flush").mockRejectedValue(new Error("storage flush failed"));
+
+		await session.sendUserMessage("question");
+		await session.waitForIdle();
+
+		expect(requests()).toBe(1);
+		expect(contributions).toHaveLength(0);
+		expect(terminalMessage).toMatchObject({ role: "assistant", stopReason: "error" });
+	});
+
+	it("awaits turn_end compaction and continues with its rewritten context and returned contribution", async () => {
+		const manager = compactableManager();
+		const initialMessages = manager.buildSessionContext().messages;
+		let turnEnd = 0;
+		const { session, contexts, errors } = await createTurnEndSession(
+			"test-turn-end-owned-compaction",
+			api => {
+				api.on("turn_end", async (_event, ctx) => {
+					if (turnEnd++ > 0) return;
+					await ctx.compact("Summarize the earlier test history.");
+					return {
+						entries: [
+							{
+								type: "custom_message",
+								customType: "owned-compaction-contribution",
+								content: "post-compaction contribution",
+								display: false,
+							},
+						],
+						continue: true,
+					};
+				});
+			},
+			manager,
+			Settings.isolated({ "compaction.enabled": false, "compaction.keepRecentTokens": 1 }),
+			initialMessages,
+		);
+
+		await session.sendUserMessage("continue after compaction");
+		expect(errors).toEqual([]);
+
+		const continuation = JSON.stringify(contexts.at(-1)?.messages);
+		expect(
+			contexts.at(-1)?.messages.some(message => message.role === "user" && message.historyRewriteAt !== undefined),
+		).toBe(true);
+		expect(continuation).toContain("post-compaction contribution");
+		expect(continuation).not.toContain("earlier request 0");
+	});
+	it("adopts a committed rewrite while draining compaction after its hook scope closes", async () => {
+		const manager = compactableManager();
+		const committed = Promise.withResolvers<void>();
+		const releaseObserver = Promise.withResolvers<void>();
+		const compactionErrors: unknown[] = [];
+		let turns = 0;
+		const { session, contexts, signals, errors } = await createTurnEndSession(
+			"test-turn-end-committed-drain",
+			api => {
+				api.on("session_compact", async () => {
+					committed.resolve();
+					await releaseObserver.promise;
+				});
+				api.on("turn_end", async (_event, ctx) => {
+					if (turns++ > 0) return;
+					void ctx.compact({ mode: "soft" }).catch(error => {
+						compactionErrors.push(error);
+					});
+					await committed.promise;
+					return {
+						entries: [
+							{
+								type: "custom_message",
+								customType: "after-committed-drain",
+								content: "continue from the committed summary",
+								display: false,
+							},
+						],
+						continue: true,
+					};
+				});
+			},
+			manager,
+			Settings.isolated({ "compaction.enabled": false, "compaction.keepRecentTokens": 1 }),
+			manager.buildSessionContext().messages,
+		);
+		const prompt = session.sendUserMessage("compact then continue");
+		try {
+			await committed.promise;
+			const signal = signals.at(-1);
+			if (!signal) throw new Error("Expected the summarizer's cancellation signal");
+			if (!signal.aborted) {
+				await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+			}
+		} finally {
+			releaseObserver.resolve();
+		}
+		await prompt;
+		expect(errors).toEqual([]);
+		expect(compactionErrors).toEqual([]);
+		const continuation = JSON.stringify(contexts.at(-1)?.messages);
+		expect(
+			contexts.at(-1)?.messages.some(message => message.role === "user" && message.historyRewriteAt !== undefined),
+		).toBe(true);
+		expect(continuation).toContain("continue from the committed summary");
+		expect(continuation).not.toContain("earlier request 0");
+	});
+	it("cancels and drains an unawaited turn_end compaction before releasing its owner loop", async () => {
+		const seededManager = compactableManager();
+		const escapedCompaction = Promise.withResolvers<unknown>();
+		const { session, manager } = await createTurnEndSession(
+			"test-turn-end-expired-compaction",
+			api => {
+				api.on("turn_end", (_event, ctx) => {
+					void ctx.compact().then(
+						() => escapedCompaction.resolve("completed"),
+						error => escapedCompaction.resolve(error),
+					);
+				});
+			},
+			seededManager,
+			Settings.isolated({ "compaction.enabled": false, "compaction.keepRecentTokens": 1 }),
+			seededManager.buildSessionContext().messages,
+		);
+
+		await session.sendUserMessage("finish this turn");
+
+		expect(await escapedCompaction.promise).toBeInstanceOf(Error);
+		expect(manager.getBranch().some(entry => entry.type === "compaction")).toBe(false);
+	});
+	it("refuses background compaction inherited from a completed turn_end scope", async () => {
+		const manager = compactableManager();
+		const release = Promise.withResolvers<void>();
+		const completed = Promise.withResolvers<unknown>();
+		const { session, requests } = await createTurnEndSession(
+			"test-turn-end-late-compaction",
+			api => {
+				api.on("turn_end", (_event, ctx) => {
+					void release.promise
+						.then(() => ctx.compact())
+						.then(
+							() => completed.resolve("unexpected compaction"),
+							error => completed.resolve(error),
+						);
+				});
+			},
+			manager,
+			Settings.isolated({ "compaction.enabled": false, "compaction.keepRecentTokens": 1 }),
+			manager.buildSessionContext().messages,
+		);
+		await session.sendUserMessage("finish before maintenance");
+		release.resolve();
+		expect(await completed.promise).toBeInstanceOf(Error);
+		expect(requests()).toBe(1);
+		expect(manager.getBranch().some(entry => entry.type === "compaction")).toBe(false);
+	});
 	it.each([false, true])("awaits ordered async delivery, final flush=%s", async finalFlush => {
 		const chunks = ["A", finalFlush ? "$" : "B"];
 		const session = sideSession(chunks, finalFlush);
@@ -513,7 +813,7 @@ describe("AgentSession message pipeline", () => {
 			const saved = runner.createContext();
 			testSetExtensionHandlerTimeoutMs(cancellation === "handler timeout" ? 100 : 1000);
 			try {
-				const emission = runner.emit({ type: "session_start" });
+				const emission = runner.emit({ type: "session_start", reason: "startup" });
 				await started.promise;
 				if (cancellation === "caller cancellation") caller.abort();
 				await emission;

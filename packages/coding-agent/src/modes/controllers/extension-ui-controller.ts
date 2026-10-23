@@ -47,6 +47,7 @@ import { setExtensionTerminalTitle, setSessionTerminalTitle } from "../../utils/
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { launchTerminal } from "../../subprocess/terminal-launch";
 import { approvalAnswerForChoice, approvalChoiceLabels, approvalOnceLabel } from "../../tools/approval";
+import type { RemoteDialogRequest, RemoteDialogResponse } from "../../modes/remote-dialogs";
 
 const MAX_WIDGET_LINES = 10;
 
@@ -104,6 +105,36 @@ function toWireSelectOptions(options: ExtensionUISelectItem[]): CollabUiSelectIt
 				: { label: option.label },
 	);
 }
+function isRemoteDialogValueValid(request: RemoteDialogRequest, response: RemoteDialogResponse): boolean {
+	if (response.kind !== "answered") return false;
+	const { value } = response;
+	switch (request.kind) {
+		case "select":
+		case "editor":
+		case "input":
+			return value === undefined || typeof value === "string";
+		case "confirm":
+			return value === undefined || typeof value === "boolean";
+		case "ask":
+			if (value === undefined) return true;
+			if (typeof value !== "object" || value === null) return false;
+			if (value.kind === "chat") return true;
+			return (
+				value.kind === "submit" &&
+				Array.isArray(value.results) &&
+				value.results.length === request.questions.length &&
+				value.results.every(
+					(result, index) =>
+						result.id === request.questions[index]?.id &&
+						Array.isArray(result.options) &&
+						Array.isArray(result.selectedOptions) &&
+						typeof result.question === "string" &&
+						typeof result.multi === "boolean" &&
+						(result.customInput === undefined || typeof result.customInput === "string"),
+				)
+			);
+	}
+}
 
 export class ExtensionUiController {
 	#extensionTerminalInputUnsubscribers = new Set<() => void>();
@@ -115,6 +146,7 @@ export class ExtensionUiController {
 	// the rest queue. See `#presentDialog`.
 	#dialogActive = false;
 	#dialogQueue: Array<() => void> = [];
+	#sessionDialogLifetime = new AbortController();
 	/**
 	 * The steering messages that last denied an approval. Steering waits for the tool batch to
 	 * end, so while any of them is still pending, later approvals of that batch (an exclusive call
@@ -143,6 +175,16 @@ export class ExtensionUiController {
 	disposeComposerShapes(): void {
 		for (const dispose of this.#composerShapeDisposers.splice(0)) dispose();
 	}
+	/** Aborts dialogs owned by the outgoing session before extensions receive its successor event. */
+	advanceSessionDialogs(): void {
+		this.disposeSessionDialogs();
+		this.#sessionDialogLifetime = new AbortController();
+	}
+
+	/** Permanently aborts this controller's session dialog surface. */
+	disposeSessionDialogs(): void {
+		this.#sessionDialogLifetime.abort();
+	}
 
 	/**
 	 * Initialize the hook system with TUI-based UI context.
@@ -152,9 +194,9 @@ export class ExtensionUiController {
 		const uiContext: ExtensionUIContext = {
 			timeoutStartsOnPresentation: true,
 			supportsEditor: true,
-			select: (title, options, dialogOptions) => this.showCollabAwareSelector(title, options, dialogOptions),
-			confirm: (title, message, dialogOptions) => this.showHookConfirm(title, message, dialogOptions),
-			input: (title, placeholder, dialogOptions) => this.showHookInput(title, placeholder, dialogOptions),
+			select: (title, options, dialogOptions) => this.showRemoteAwareSelector(title, options, dialogOptions),
+			confirm: (title, message, dialogOptions) => this.showRemoteAwareConfirm(title, message, dialogOptions),
+			input: (title, placeholder, dialogOptions) => this.showRemoteAwareInput(title, placeholder, dialogOptions),
 			askDialog: (questions, dialogOptions) => this.showAskDialog(questions, dialogOptions),
 			approve: (prompt, dialogOptions) => this.showCollabAwareApproval(prompt, dialogOptions),
 			notify: (message, type) => this.showHookNotify(message, type),
@@ -174,7 +216,7 @@ export class ExtensionUiController {
 			},
 			getEditorText: () => this.ctx.editor.getText(),
 			editor: (title, prefill, dialogOptions, editorOptions) =>
-				this.showCollabAwareEditor(title, prefill, dialogOptions, editorOptions),
+				this.showRemoteAwareEditor(title, prefill, dialogOptions, editorOptions),
 			addAutocompleteProvider: factory => this.ctx.addAutocompleteProvider(factory),
 			getEditorComponent: () => this.ctx.getEditorComponent(),
 			get theme() {
@@ -194,6 +236,7 @@ export class ExtensionUiController {
 			setEditorComponent: factory => this.ctx.setEditorComponent(factory),
 			getToolsExpanded: () => this.ctx.toolOutputExpanded,
 			setToolsExpanded: expanded => this.ctx.setToolsExpanded(expanded),
+			registerRemoteDialogHost: host => this.ctx.remoteDialogHosts.register(host),
 		};
 		const enrichedUiContext = withTerminalLauncher(uiContext, true);
 		this.ctx.setToolUIContext(enrichedUiContext, true);
@@ -251,6 +294,8 @@ export class ExtensionUiController {
 			resolvePlanReview: (reviewId, choice, input) => this.ctx.resolvePlanReview(reviewId, choice, input),
 			getPendingPlanReview: () => this.ctx.getPendingPlanReview(),
 			openPlanReview: () => this.ctx.openPlanReview({ fromExtension: true }),
+			getPlanMode: () => this.ctx.getPlanMode(),
+			setPlanMode: (action, options) => this.ctx.setPlanMode(action, options),
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
@@ -357,9 +402,10 @@ export class ExtensionUiController {
 			this.showExtensionError(error.extensionPath, error.error);
 		});
 
-		// Emit session_start event
+		// Initial interactive context startup.
 		await extensionRunner.emit({
 			type: "session_start",
+			reason: "startup",
 		});
 	}
 
@@ -482,6 +528,8 @@ export class ExtensionUiController {
 			resolvePlanReview: (reviewId, choice, input) => this.ctx.resolvePlanReview(reviewId, choice, input),
 			getPendingPlanReview: () => this.ctx.getPendingPlanReview(),
 			openPlanReview: () => this.ctx.openPlanReview({ fromExtension: true }),
+			getPlanMode: () => this.ctx.getPlanMode(),
+			setPlanMode: (action, options) => this.ctx.setPlanMode(action, options),
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
@@ -627,6 +675,135 @@ export class ExtensionUiController {
 		this.ctx.ui.requestRender();
 	}
 
+	showRemoteAwareSelector(
+		title: string,
+		options: ExtensionUISelectItem[],
+		dialogOptions?: InteractiveSelectorDialogOptions,
+		extra?: { slider?: HookSelectorSlider },
+	): Promise<string | undefined> {
+		const request: RemoteDialogRequest = {
+			kind: "select",
+			title,
+			options: toWireSelectOptions(options),
+			initialIndex: dialogOptions?.initialIndex,
+			selectionMarker: dialogOptions?.selectionMarker,
+			checkedIndices: dialogOptions?.checkedIndices ? [...dialogOptions.checkedIndices] : undefined,
+			markableCount: dialogOptions?.markableCount,
+			helpText: dialogOptions?.helpText,
+			provenance: this.#remoteDialogProvenance("extension-user"),
+		};
+		return this.#raceRegisteredDialog(request, dialogOptions?.signal, signal =>
+			this.showHookSelector(title, options, { ...dialogOptions, signal }, extra),
+		);
+	}
+
+	showRemoteAwareConfirm(
+		title: string,
+		message: string,
+		dialogOptions?: InteractiveSelectorDialogOptions,
+	): Promise<boolean> {
+		const request: RemoteDialogRequest = {
+			kind: "confirm",
+			title,
+			message,
+			provenance: this.#remoteDialogProvenance("extension-user"),
+		};
+		return this.#raceRegisteredDialog<boolean>(request, dialogOptions?.signal, signal =>
+			this.showHookConfirm(title, message, { ...dialogOptions, signal }),
+		).then(value => value === true);
+	}
+
+	showRemoteAwareInput(
+		title: string,
+		placeholder?: string,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<string | undefined> {
+		const request: RemoteDialogRequest = {
+			kind: "input",
+			title,
+			placeholder,
+			provenance: this.#remoteDialogProvenance("extension-user"),
+		};
+		return this.#raceRegisteredDialog(request, dialogOptions?.signal, signal =>
+			this.showHookInput(title, placeholder, { ...dialogOptions, signal }),
+		);
+	}
+
+	showRemoteAwareEditor(
+		title: string,
+		prefill?: string,
+		dialogOptions?: ExtensionUIDialogOptions,
+		editorOptions?: { promptStyle?: boolean },
+	): Promise<string | undefined> {
+		const request: RemoteDialogRequest = {
+			kind: "editor",
+			title,
+			prefill,
+			provenance: this.#remoteDialogProvenance("extension-user"),
+		};
+		return this.#raceRegisteredDialog(request, dialogOptions?.signal, signal =>
+			this.showHookEditor(title, prefill, { ...dialogOptions, signal }, editorOptions),
+		);
+	}
+
+	#remoteDialogProvenance(promptClass: "agent-ask" | "extension-user") {
+		return this.ctx.remoteDialogHosts.provenance(promptClass);
+	}
+
+	async #raceRegisteredDialog<T>(
+		request: RemoteDialogRequest,
+		signal: AbortSignal | undefined,
+		local: (signal: AbortSignal | undefined) => Promise<T>,
+	): Promise<T> {
+		type Winner = { source: "local" | "remote"; value: T };
+		const sessionSignal = this.#sessionDialogLifetime.signal;
+		const dialogSignal = signal ? AbortSignal.any([signal, sessionSignal]) : sessionSignal;
+		const hosts = this.ctx.remoteDialogHosts.list(request.provenance.generation);
+		if (hosts.length === 0) return local(dialogSignal);
+		const localAbort = new AbortController();
+		const localSignal = AbortSignal.any([dialogSignal, localAbort.signal]);
+		const localResult: Promise<Winner> = local(localSignal).then(value => ({ source: "local", value }));
+		let winnerHost: (typeof hosts)[number] | undefined;
+		const remotes = hosts.flatMap(entry => {
+			const controller = new AbortController();
+			const hostSignal = AbortSignal.any([entry.signal, controller.signal, dialogSignal]);
+			try {
+				const remote = entry.host.request(request, hostSignal);
+				if (!remote) return [];
+				return [
+					{
+						entry,
+						controller,
+						answer: remote.then<Winner, Winner>(
+							(result): Winner | Promise<Winner> => {
+								if (
+									result.kind === "unavailable" ||
+									!entry.isActive() ||
+									hostSignal.aborted ||
+									!isRemoteDialogValueValid(request, result)
+								) {
+									return localResult;
+								}
+								winnerHost ??= entry;
+								return { source: "remote" as const, value: result.value as T };
+							},
+							() => localResult,
+						),
+					},
+				];
+			} catch {
+				return [];
+			}
+		});
+		if (remotes.length === 0) return localResult.then(winner => winner.value);
+		const winner = await Promise.race([localResult, ...remotes.map(remote => remote.answer)]);
+		if (winner.source === "remote") localAbort.abort();
+		for (const remote of remotes) {
+			if (remote.entry !== winnerHost) remote.controller.abort();
+		}
+		return winner.value;
+	}
+
 	async showCollabAwareSelector(
 		title: string,
 		options: ExtensionUISelectItem[],
@@ -763,6 +940,20 @@ export class ExtensionUiController {
 	}
 
 	async showAskDialog(
+		questions: ExtensionAskDialogQuestion[],
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<ExtensionAskDialogResult | undefined> {
+		const request: RemoteDialogRequest = {
+			kind: "ask",
+			questions: normalizeDialogQuestions(questions),
+			provenance: this.#remoteDialogProvenance("extension-user"),
+		};
+		return this.#raceRegisteredDialog(request, dialogOptions?.signal, signal =>
+			this.#showCollabAwareAskDialog(questions, { ...dialogOptions, signal }),
+		);
+	}
+
+	async #showCollabAwareAskDialog(
 		questions: ExtensionAskDialogQuestion[],
 		dialogOptions?: ExtensionUIDialogOptions,
 	): Promise<ExtensionAskDialogResult | undefined> {

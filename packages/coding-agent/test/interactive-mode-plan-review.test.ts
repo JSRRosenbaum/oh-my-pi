@@ -778,6 +778,110 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(events.filter(event => event.type === "plan_review_resolved")).toHaveLength(1);
 		expect(prompt).not.toHaveBeenCalled();
 	});
+	for (const action of ["pause", "exit"] as const) {
+		it(`settles a pending review before setPlanMode ${action} can race its late answer`, async () => {
+			const planFilePath = "local://PLAN.md";
+			const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			});
+			await Bun.write(resolvedPlanPath, "# Plan\n\nDo the thing.");
+
+			mode.planModeEnabled = true;
+			mode.planModePlanFilePath = planFilePath;
+			const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+			const opened = Promise.withResolvers<PlanReviewRequestedEvent>();
+			const settled = Promise.withResolvers<PlanReviewResolvedEvent>();
+			observeExtensionEvents(session, event => {
+				if (event.type === "plan_review_requested") opened.resolve(event);
+				if (event.type === "plan_review_resolved") settled.resolve(event);
+			});
+
+			const approval = mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+			const requested = await opened.promise;
+			expect(await mode.setPlanMode(action, { confirmed: true })).toBe(true);
+			expect(mode.resolvePlanReview(requested.reviewId, "refine", { feedback: "too late" })).toBe(false);
+			await approval;
+
+			expect(await settled.promise).toMatchObject({
+				reviewId: requested.reviewId,
+				choice: undefined,
+				by: "local",
+			});
+			expect(prompt).not.toHaveBeenCalled();
+			expect(mode.getPendingPlanReview()).toBeUndefined();
+			expect(mode.getPlanMode()).toBe(action === "pause" ? "paused" : "off");
+		});
+		it(`preserves a pending review when unconfirmed ${action} is refused`, async () => {
+			const planFilePath = "local://PLAN.md";
+			const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			});
+			await Bun.write(resolvedPlanPath, "# Plan\n\nKeep this review active.");
+			mode.planModeEnabled = true;
+			mode.planModePlanFilePath = planFilePath;
+			const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+			const opened = Promise.withResolvers<PlanReviewRequestedEvent>();
+			const recorder = planReviewRecorder("confirmation-refused", event => opened.resolve(event));
+			await loadExtensions(recorder.extension);
+
+			const approval = mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+			const requested = await opened.promise;
+			expect(await mode.setPlanMode(action)).toBe(false);
+			expect(mode.getPlanMode()).toBe("active");
+			expect(mode.getPendingPlanReview()?.reviewId).toBe(requested.reviewId);
+			expect(mode.ui.hasOverlay()).toBe(true);
+			expect(mode.resolvePlanReview(requested.reviewId, "refine", { feedback: "Continue refining" })).toBe(true);
+			await approval;
+			expect(await recorder.resolved).toMatchObject({
+				reviewId: requested.reviewId,
+				choice: "refine",
+				by: "extension",
+			});
+			expect(prompt).toHaveBeenCalledWith("Continue refining");
+		});
+	}
+	it.each([
+		{ transition: "exit", choice: "execute" as const, feedback: undefined },
+		{ transition: "exit", choice: "refine" as const, feedback: "stale refinement" },
+		{ transition: "stop", choice: "execute" as const, feedback: undefined },
+		{ transition: "stop", choice: "refine" as const, feedback: "stale refinement" },
+		{ transition: "switch", choice: "execute" as const, feedback: undefined },
+		{ transition: "switch", choice: "refine" as const, feedback: "stale refinement" },
+	])("invalidates an accepted $choice before dispatch on $transition", async ({ transition, choice, feedback }) => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nDo the thing.");
+
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+		const opened = Promise.withResolvers<PlanReviewRequestedEvent>();
+		observeExtensionEvents(session, event => {
+			if (event.type === "plan_review_requested") opened.resolve(event);
+		});
+
+		const approval = mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+		const requested = await opened.promise;
+		expect(mode.resolvePlanReview(requested.reviewId, choice, { feedback })).toBe(true);
+		expect(mode.resolvePlanReview(requested.reviewId, "refine", { feedback: "second answer" })).toBe(false);
+		if (transition === "stop") {
+			mode.stop();
+			await approval;
+		} else {
+			const leaving =
+				transition === "exit" ? mode.setPlanMode("exit", { confirmed: true }) : mode.prepareSessionSwitch();
+			await Promise.all([approval, leaving]);
+		}
+
+		expect(prompt).not.toHaveBeenCalled();
+		expect(mode.getPendingPlanReview()).toBeUndefined();
+		expect(mode.getPlanMode()).toBe(transition === "exit" ? "off" : "active");
+	});
 
 	it("settles a replaced review once without letting its continuation hide the replacement", async () => {
 		const planFilePath = "local://PLAN.md";
@@ -823,6 +927,36 @@ describe("InteractiveMode plan review rendering", () => {
 		await mode.prepareSessionSwitch();
 		await secondApproval;
 		await secondSettled.promise;
+	});
+
+	it("renews extension dialog lifetime before restarted session_start handlers", async () => {
+		const extension = planReviewExtension("restart-session-start", () => {});
+		const outcomes: Array<{ answer: string | undefined; signalAborted: boolean }> = [];
+		const startupHandler = async (...args: unknown[]): Promise<void> => {
+			const ctx = args[1] as ExtensionContext;
+			if (!ctx.ui.registerRemoteDialogHost) throw new Error("Expected remote dialog host support");
+			let signalAborted = true;
+			const dispose = ctx.ui.registerRemoteDialogHost({
+				request: (_request, signal) => {
+					signalAborted = signal.aborted;
+					if (signal.aborted) return null;
+					return Promise.resolve({ kind: "answered", value: "ready" });
+				},
+			});
+			try {
+				outcomes.push({ answer: await ctx.ui.select("Startup dialog", ["ready"]), signalAborted });
+			} finally {
+				dispose();
+			}
+		};
+		extension.handlers.set("session_start", [startupHandler]);
+		await loadExtensions(extension);
+		mode.stop();
+		await mode.init({ suppressWelcomeIntro: true });
+		expect(outcomes).toEqual([
+			{ answer: "ready", signalAborted: false },
+			{ answer: "ready", signalAborted: false },
+		]);
 	});
 
 	it("invalidates an open review when the interactive mode stops", async () => {
