@@ -3614,6 +3614,7 @@ func (v TurnStartEvent) MarshalJSON() ([]byte, error) {
 type TurnEndEvent struct {
 	Message     AgentMessage        `json:"message"`
 	ToolResults []ToolResultMessage `json:"toolResults"`
+	Outcome     TurnEndEventOutcome `json:"outcome"`
 }
 
 func (v *TurnEndEvent) UnmarshalJSON(data []byte) error {
@@ -3626,6 +3627,7 @@ func (v *TurnEndEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "turn_end")
 	d.required("message", &out.Message)
 	d.required("toolResults", &out.ToolResults)
+	d.required("outcome", &out.Outcome)
 	if d.err != nil {
 		return d.err
 	}
@@ -3636,6 +3638,27 @@ func (v *TurnEndEvent) decodeFrom(raw map[string]json.RawMessage) error {
 func (v TurnEndEvent) MarshalJSON() ([]byte, error) {
 	type plain TurnEndEvent
 	return encodeObject(plain(v), `"type":"turn_end"`, nil)
+}
+
+type TurnEndEventOutcome string
+
+const (
+	TurnEndEventOutcomeCompleted TurnEndEventOutcome = "completed"
+	TurnEndEventOutcomeAborted   TurnEndEventOutcome = "aborted"
+	TurnEndEventOutcomeError     TurnEndEventOutcome = "error"
+)
+
+func (v *TurnEndEventOutcome) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "TurnEndEventOutcome")
+	if err != nil {
+		return err
+	}
+	switch value := TurnEndEventOutcome(s); value {
+	case TurnEndEventOutcomeCompleted, TurnEndEventOutcomeAborted, TurnEndEventOutcomeError:
+		*v = value
+		return nil
+	}
+	return unknownValue("TurnEndEventOutcome", s)
 }
 
 type MessageStartEvent struct {
